@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SBC Hub Theme Settings
 // @namespace    https://hub.sbcwork.com/
-// @version      3.1.0
+// @version      3.2.0
 // @description  Adds SBC Hub themes, custom theme settings, header controls, and multi-step undo/redo.
 // @match        https://hub.sbcwork.com/*
 // @grant        GM_registerMenuCommand
@@ -30,6 +30,7 @@ const THEME_INSPECT_HIGHLIGHT_ATTR = "data-tm-theme-setting-match";
 const THEME_INSPECT_TARGET_ATTR = "data-tm-theme-inspect-target";
 const THEME_HISTORY_LIMIT = 100;
 const THEME_HISTORY_COALESCE_MS = 350;
+const THEME_INSPECT_MAX_NODES = 350;
 const themeUndoStack = [];
 const themeRedoStack = [];
 let themeHistoryRestoring = false;
@@ -1073,23 +1074,43 @@ function resetCustomThemeToStock(customTheme) {
     saveCustomThemeOverrides(all, `reset-${customTheme}-${Date.now()}`);
 }
 
-function saveScopedThemeRule(theme, scope, selector, property, value) {
-    if (!isCustomTheme(theme) || !selector || !property || !value) return;
-    const allowed = new Set([
-        "color", "background-color", "border-top-color", "border-right-color",
-        "border-bottom-color", "border-left-color", "outline-color",
-        "text-decoration-color", "caret-color", "fill", "stroke",
-        "background-image", "box-shadow", "text-shadow"
-    ]);
-    if (!allowed.has(property)) return;
+const SCOPED_THEME_ALLOWED_PROPERTIES = new Set([
+    "color", "background-color", "border-top-color", "border-right-color",
+    "border-bottom-color", "border-left-color", "outline-color",
+    "text-decoration-color", "caret-color", "fill", "stroke",
+    "background-image", "box-shadow", "text-shadow"
+]);
+
+function saveScopedThemeRules(theme, scope, changes, historyKey = "scoped-theme-edit") {
+    if (!isCustomTheme(theme) || !Array.isArray(changes) || !changes.length) return;
+    const valid = changes.filter(change =>
+        change && change.selector && change.property && change.value
+        && SCOPED_THEME_ALLOWED_PROPERTIES.has(change.property)
+    );
+    if (!valid.length) return;
+
     const all = getCustomThemeOverrides();
     all[theme] ||= {};
     const scoped = Array.isArray(all[theme].scoped) ? all[theme].scoped : [];
-    const existing = scoped.find(rule => rule.scope === scope && rule.selector === selector && rule.property === property);
-    if (existing) existing.value = value;
-    else scoped.push({ scope, selector, property, value });
+    const index = new Map(scoped.map((rule, i) => [`${rule.scope}|${rule.selector}|${rule.property}`, i]));
+
+    for (const change of valid) {
+        const key = `${scope}|${change.selector}|${change.property}`;
+        const existingIndex = index.get(key);
+        if (existingIndex == null) {
+            index.set(key, scoped.length);
+            scoped.push({ scope, selector: change.selector, property: change.property, value: change.value });
+        } else {
+            scoped[existingIndex].value = change.value;
+        }
+    }
+
     all[theme].scoped = scoped.slice(-800);
-    saveCustomThemeOverrides(all, `scoped:${theme}:${scope}:${selector}:${property}`);
+    saveCustomThemeOverrides(all, historyKey);
+}
+
+function saveScopedThemeRule(theme, scope, selector, property, value) {
+    saveScopedThemeRules(theme, scope, [{ selector, property, value }], `scoped:${theme}:${scope}:${selector}:${property}`);
 }
 
 function ensureExactThemeSelector(element, targetDocument) {
@@ -1176,7 +1197,18 @@ function collectActualThemeColors(selected, targetDocument) {
     if (!selected || selected.nodeType !== 1) return rows;
     const nodes = [];
     if (selected.parentElement && !selected.parentElement.closest?.(`[${THEME_EDITOR_ATTR}]`)) nodes.push(selected.parentElement);
-    nodes.push(selected, ...selected.querySelectorAll('*'));
+    nodes.push(selected);
+
+    // Do not materialize selected.querySelectorAll("*") for large application containers.
+    // Walk only a bounded number of descendants so inspecting <main>, tables, or dashboards
+    // cannot freeze the tab while getComputedStyle() is called for thousands of nodes.
+    const walker = targetDocument.createTreeWalker(selected, NodeFilter.SHOW_ELEMENT);
+    let current = walker.nextNode();
+    while (current && nodes.length < THEME_INSPECT_MAX_NODES) {
+        nodes.push(current);
+        current = walker.nextNode();
+    }
+    const inspectionTruncated = Boolean(current);
 
     const solidProps = [
         'color','background-color','border-top-color','border-right-color','border-bottom-color','border-left-color',
@@ -1238,6 +1270,7 @@ function collectActualThemeColors(selected, targetDocument) {
 
     rows.push(...grouped.values());
     rows.sort((a,b) => Number(b.selectedDirect) - Number(a.selectedDirect) || a.label.localeCompare(b.label));
+    rows.inspectionTruncated = inspectionTruncated;
     return rows;
 }
 
@@ -1254,6 +1287,14 @@ function renderThemeSettingsRows(panel, theme) {
     body.innerHTML = '';
     const context = panel.__tmInspectContext;
     const rows = context?.rows || [];
+
+    if (rows.inspectionTruncated) {
+        const notice = document.createElement("div");
+        notice.className = "tm-empty";
+        notice.style.marginBottom = "12px";
+        notice.textContent = `Large selection: inspected the first ${THEME_INSPECT_MAX_NODES} elements for performance. Select a smaller container to inspect deeper descendants.`;
+        body.appendChild(notice);
+    }
 
     if (!rows.length) {
         body.innerHTML = `<div class="tm-empty">Click an element on the page. The editor will show the actual computed colors on that element, its direct parent, and its descendants. Changes are written directly to those exact targets instead of guessing a palette token.</div>`;
@@ -1287,6 +1328,7 @@ function renderThemeSettingsRows(panel, theme) {
                 const activeTheme = panel.dataset.editTheme || theme;
                 const cssValue = colorEntryToCss([color.value.toLowerCase(), Number(range.value)]);
                 const scope = context.targetDocument === document ? 'page' : 'viewer';
+                const changes = [];
                 for (const binding of item.bindings) {
                     let value = cssValue;
                     if (binding.tokenIndex != null) {
@@ -1294,13 +1336,14 @@ function renderThemeSettingsRows(panel, theme) {
                         try { current = context.targetDocument.defaultView.getComputedStyle(binding.node).getPropertyValue(binding.property).trim() || current; } catch {}
                         value = replaceNthCssColor(current, binding.tokenIndex, cssValue);
                     }
-                    saveScopedThemeRule(activeTheme, scope, binding.selector, binding.property, value);
+                    changes.push({ selector: binding.selector, property: binding.property, value });
                 }
+                saveScopedThemeRules(activeTheme, scope, changes, `inspect:${activeTheme}:${scope}:${item.id}`);
                 item.hex = color.value.toLowerCase();
                 item.alpha = Number(range.value);
                 text.value = item.hex;
                 alphaText.textContent = `${range.value}%`;
-                installPageWideThemeEditor();
+                scheduleThemeApply();
             };
             color.addEventListener('input', commit);
             color.addEventListener('change', commit);
@@ -1419,6 +1462,15 @@ function openThemeSettings(preferredTheme = null) {
     installThemeInspectorsEverywhere();
 }
 
+function scheduleThemeApply() {
+    if (scheduleThemeApply.pending) return;
+    scheduleThemeApply.pending = true;
+    requestAnimationFrame(() => {
+        scheduleThemeApply.pending = false;
+        installPageWideThemeEditor();
+    });
+}
+
 function installPageWideThemeEditor() {
     const theme = getGlobalHubTheme();
     setDocumentThemeMode(document, theme);
@@ -1452,17 +1504,6 @@ function setGlobalHubTheme(theme, persist = true) {
     if (footerThemeSelect) footerThemeSelect.value = selected;
     installPageWideThemeEditor();
 
-    const viewerDocument = document.getElementById(VIEWER_HOST_ID)?.querySelector("iframe")?.contentDocument;
-    if (viewerDocument?.documentElement) {
-        setDocumentThemeMode(viewerDocument, selected);
-        if (isCustomTheme(selected)) {
-            clearSrpViewerInlineTheme(viewerDocument);
-            applyCustomThemeStyles(viewerDocument, "global", selected);
-        } else {
-            applyCustomThemeStyles(viewerDocument, "global", selected); // clears stale custom CSS
-            applySrpViewerTheme(viewerDocument, selected === "discord-dark" ? "dark" : "light");
-        }
-    }
     return selected;
 }
 
@@ -1526,13 +1567,7 @@ function installThemeIntoLoadedFrame(frame) {
         if (!frameDocument?.documentElement) return;
         const theme = getGlobalHubTheme();
         setDocumentThemeMode(frameDocument, theme);
-        if (isCustomTheme(theme)) {
-            clearSrpViewerInlineTheme(frameDocument);
-            applyCustomThemeStyles(frameDocument, "global", theme);
-        } else {
-            applyCustomThemeStyles(frameDocument, "global", theme);
-            applySrpViewerTheme(frameDocument, theme === "discord-dark" ? "dark" : "light");
-        }
+        applyCustomThemeStyles(frameDocument, "global", theme);
         if (document.getElementById(THEME_SETTINGS_PANEL_ID)) installThemeElementInspector(frameDocument);
     } catch {}
 }
@@ -1542,8 +1577,10 @@ function scheduleThemeUiRefresh() {
     scheduleThemeUiRefresh.pending = true;
     requestAnimationFrame(() => {
         scheduleThemeUiRefresh.pending = false;
+        // Existing CSS rules automatically affect newly rendered React nodes.
+        // Only repair the injected header control here; re-installing the full theme
+        // on every DOM mutation caused a render/mutation feedback loop and severe lag.
         injectHeaderThemeControl();
-        installPageWideThemeEditor();
     });
 }
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SBC Hub Update Toast Hider
 // @namespace    https://hub.sbcwork.com/
-// @version      1.0.1
+// @version      1.0.2
 // @description  Removes the "A new version of SBC Hub is available" Sonner notification without affecting other Hub toasts.
 // @match        https://hub.sbcwork.com/*
 // @run-at       document-start

@@ -1,0 +1,1588 @@
+// ==UserScript==
+// @name         SBC Hub Theme Settings
+// @namespace    https://hub.sbcwork.com/
+// @version      3.1.0
+// @description  Adds SBC Hub themes, custom theme settings, header controls, and multi-step undo/redo.
+// @match        https://hub.sbcwork.com/*
+// @grant        GM_registerMenuCommand
+// @run-at       document-start
+// @noframes
+// ==/UserScript==
+
+(() => {
+"use strict";
+
+const VIEWER_HOST_ID = "tm-srp-grid-viewer-host";
+const HIDDEN_MARKER = "data-tm-srp-hidden";
+const HUB_THEME_STORAGE_KEY = "sbcSrpGlobalHubTheme";
+const HUB_THEME_ATTRIBUTE = "data-tm-srp-hub-theme";
+const HUB_THEME_STYLE_ID = "tm-srp-global-hub-theme-style";
+const CUSTOM_THEME_STORAGE_KEY = "sbcSrpCustomThemeOverridesV1";
+const CUSTOM_THEME_STYLE_ID = "tm-srp-custom-theme-style";
+const THEME_EDITOR_ATTR = "data-tm-theme-editor";
+const THEME_SETTINGS_PANEL_ID = "tm-srp-theme-settings-panel";
+const THEME_SETTINGS_STYLE_ID = "tm-srp-theme-settings-style";
+const FOOTER_THEME_CONTROL_ID = "tm-srp-footer-theme-control";
+const FOOTER_THEME_SELECT_ID = "tm-srp-footer-theme-select";
+const THEME_SETTINGS_OPEN_ATTR = "data-tm-theme-settings-open";
+const ACTIVE_THEME_ATTRIBUTE = "data-tm-srp-active-theme";
+const THEME_INSPECT_HIGHLIGHT_ATTR = "data-tm-theme-setting-match";
+const THEME_INSPECT_TARGET_ATTR = "data-tm-theme-inspect-target";
+const THEME_HISTORY_LIMIT = 100;
+const THEME_HISTORY_COALESCE_MS = 350;
+const themeUndoStack = [];
+const themeRedoStack = [];
+let themeHistoryRestoring = false;
+let lastThemeHistoryKey = "";
+let lastThemeHistoryAt = 0;
+
+function captureThemeSnapshot() {
+    let overrides = {};
+    try { overrides = JSON.parse(localStorage.getItem(CUSTOM_THEME_STORAGE_KEY) || "{}"); } catch {}
+    return {
+        theme: getGlobalHubTheme(),
+        overrides: overrides && typeof overrides === "object" ? overrides : {}
+    };
+}
+
+function sameThemeSnapshot(a, b) {
+    if (!a || !b || a.theme !== b.theme) return false;
+    try { return JSON.stringify(a.overrides || {}) === JSON.stringify(b.overrides || {}); }
+    catch { return false; }
+}
+
+function updateThemeHistoryButtons() {
+    const panel = document.getElementById(THEME_SETTINGS_PANEL_ID);
+    const undo = panel?.querySelector('[data-action="undo"]');
+    const redo = panel?.querySelector('[data-action="redo"]');
+    if (undo) { undo.disabled = themeUndoStack.length === 0; undo.title = `Undo theme change (${themeUndoStack.length} available)`; }
+    if (redo) { redo.disabled = themeRedoStack.length === 0; redo.title = `Redo theme change (${themeRedoStack.length} available)`; }
+}
+
+function recordThemeHistory(key = "theme-change") {
+    if (themeHistoryRestoring) return;
+    const now = Date.now();
+    const coalesce = key === lastThemeHistoryKey && (now - lastThemeHistoryAt) <= THEME_HISTORY_COALESCE_MS;
+    if (!coalesce) {
+        const snapshot = captureThemeSnapshot();
+        const previous = themeUndoStack[themeUndoStack.length - 1];
+        if (!sameThemeSnapshot(snapshot, previous)) {
+            themeUndoStack.push(snapshot);
+            if (themeUndoStack.length > THEME_HISTORY_LIMIT) themeUndoStack.shift();
+        }
+        themeRedoStack.length = 0;
+    }
+    lastThemeHistoryKey = key;
+    lastThemeHistoryAt = now;
+    updateThemeHistoryButtons();
+}
+
+function refreshThemeSettingsAfterHistory() {
+    const panel = document.getElementById(THEME_SETTINGS_PANEL_ID);
+    if (!panel) return;
+    const current = isDarkTheme(getGlobalHubTheme()) ? "custom-dark" : "custom-light";
+    const editTheme = isCustomTheme(getGlobalHubTheme()) ? getGlobalHubTheme() : (panel.dataset.editTheme || current);
+    const context = panel.__tmInspectContext;
+    if (context?.element?.isConnected) inspectThemeElement(context.element, context.targetDocument);
+    else renderThemeSettingsRows(panel, editTheme);
+    updateThemeHistoryButtons();
+}
+
+function applyThemeSnapshot(snapshot) {
+    if (!snapshot) return;
+    themeHistoryRestoring = true;
+    try {
+        localStorage.setItem(CUSTOM_THEME_STORAGE_KEY, JSON.stringify(snapshot.overrides || {}));
+        localStorage.setItem(HUB_THEME_STORAGE_KEY, snapshot.theme || "default");
+        setGlobalHubTheme(snapshot.theme || "default", false);
+        injectHeaderThemeControl();
+        refreshThemeSettingsAfterHistory();
+    } finally {
+        themeHistoryRestoring = false;
+        lastThemeHistoryKey = "";
+        lastThemeHistoryAt = 0;
+    }
+}
+
+function undoThemeChange() {
+    if (!themeUndoStack.length) return false;
+    const current = captureThemeSnapshot();
+    const previous = themeUndoStack.pop();
+    if (!sameThemeSnapshot(current, previous)) {
+        themeRedoStack.push(current);
+        if (themeRedoStack.length > THEME_HISTORY_LIMIT) themeRedoStack.shift();
+    }
+    applyThemeSnapshot(previous);
+    updateThemeHistoryButtons();
+    return true;
+}
+
+function redoThemeChange() {
+    if (!themeRedoStack.length) return false;
+    const current = captureThemeSnapshot();
+    const next = themeRedoStack.pop();
+    if (!sameThemeSnapshot(current, next)) {
+        themeUndoStack.push(current);
+        if (themeUndoStack.length > THEME_HISTORY_LIMIT) themeUndoStack.shift();
+    }
+    applyThemeSnapshot(next);
+    updateThemeHistoryButtons();
+    return true;
+}
+const HUB_THEME_CSS = `
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] {
+    color-scheme: dark !important;
+    --background: #313338 !important;
+    --foreground: #f2f3f5 !important;
+    --card: #2b2d31 !important;
+    --card-foreground: #f2f3f5 !important;
+    --popover: #2b2d31 !important;
+    --popover-foreground: #f2f3f5 !important;
+    --secondary: #383a40 !important;
+    --secondary-foreground: #f2f3f5 !important;
+    --muted: #383a40 !important;
+    --muted-foreground: #b5bac1 !important;
+    --accent: #404249 !important;
+    --accent-foreground: #f2f3f5 !important;
+    --border: #3f4147 !important;
+    --input: #383a40 !important;
+    --ring: #6a9a1e !important;
+    --sidebar: #2b2d31 !important;
+    --sidebar-foreground: #f2f3f5 !important;
+    --sidebar-accent: #404249 !important;
+    --sidebar-accent-foreground: #f2f3f5 !important;
+    --sidebar-border: #3f4147 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] body,
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] main[data-slot="sidebar-inset"] {
+    background-color: #313338 !important;
+    color: #f2f3f5 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [data-sidebar="sidebar"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [data-slot="sidebar"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [role="dialog"] {
+    background-color: #2b2d31 !important;
+    color: #f2f3f5 !important;
+    border-color: #3f4147 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-background"] {
+    background-color: #313338 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-white"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-card"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-popover"] {
+    background-color: #2b2d31 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-foreground"] {
+    color: #f2f3f5 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-500"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-400"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-muted-foreground"] {
+    color: #b5bac1 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-[var(--sbc-dark)]"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-black"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-900"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-slate-900"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-zinc-900"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-neutral-900"] {
+    color: #f2f3f5 !important;
+}
+
+/* Convert Tailwind's pale status surfaces into dark, hue-preserving cards. */
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-purple-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-purple-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-purple-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-purple-100"] {
+    background-color: #352d42 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-blue-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-blue-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-blue-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-blue-100"] {
+    background-color: #28364a !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-green-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-green-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-green-50/60"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-green-50/70"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-green-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-green-100"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-emerald-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-emerald-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-emerald-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-emerald-100"] {
+    background-color: #283d35 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-orange-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-orange-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-orange-50/60"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-orange-50/70"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-orange-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-orange-100"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-amber-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-amber-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-amber-50/60"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-amber-50/70"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-amber-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-amber-100"] {
+    background-color: #453629 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-red-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-red-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-red-50/60"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-red-50/70"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-red-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-red-100"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-rose-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-rose-100"] {
+    background-color: #442e33 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-yellow-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-yellow-50/40"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-yellow-50/60"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-yellow-50/70"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-yellow-50/80"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-yellow-100"] {
+    background-color: #423b27 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-cyan-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-cyan-100"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-teal-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-teal-100"] {
+    background-color: #273d40 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-indigo-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-indigo-100"] {
+    background-color: #303247 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-pink-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-pink-100"] {
+    background-color: #422f3c !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-slate-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-slate-100"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-gray-50"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-gray-100"] {
+    background-color: #383a40 !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-white/60"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-white/70"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="bg-white/80"] {
+    background-color: #1e1f22 !important;
+}
+
+/* Dark gradient equivalents for cards that otherwise retain white centers. */
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"] {
+    background-image: linear-gradient(135deg, #2b2d31, #313338) !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"][class*="from-purple-"] {
+    background-image: linear-gradient(to right, #352d42, #2b2d31, #352d42) !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"][class*="from-blue-"] {
+    background-image: linear-gradient(to right, #28364a, #2b2d31, #28364a) !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"][class*="from-green-"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"][class*="from-emerald-"] {
+    background-image: linear-gradient(to right, #283d35, #2b2d31, #283d35) !important;
+}
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"][class*="from-orange-"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="bg-gradient-to-"][class*="from-amber-"] {
+    background-image: linear-gradient(to right, #453629, #2b2d31, #453629) !important;
+}
+
+/* Keep colored status text readable without losing its category color. */
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-purple-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-purple-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-purple-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-purple-900"] { color: #c9b8ff !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-blue-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-blue-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-blue-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-blue-900"] { color: #9cc4ff !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-green-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-green-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-green-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-green-900"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-emerald-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-emerald-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-emerald-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-emerald-900"] { color: #7ee2ad !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-orange-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-orange-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-orange-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-orange-900"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-amber-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-amber-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-amber-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-amber-900"] { color: #f4bd7a !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-red-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-red-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-red-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-rose-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-rose-700"] { color: #ff9da7 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-yellow-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-yellow-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-yellow-800"] { color: #f2d675 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-cyan-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-cyan-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-teal-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-teal-700"] { color: #78dce0 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-indigo-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-indigo-700"] { color: #aeb7ff !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-pink-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-pink-700"] { color: #f4a9d1 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-slate-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-slate-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-slate-800"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-600"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-700"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class~="text-gray-800"] { color: #cbd0d6 !important; }
+
+/* Soften bright pastel borders to match their new dark surfaces. */
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-purple-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-purple-3"] { border-color: #65547e !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-blue-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-blue-3"] { border-color: #4b6488 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-green-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-green-3"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-emerald-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-emerald-3"] { border-color: #47745e !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-orange-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-orange-3"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-amber-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-amber-3"] { border-color: #7c6042 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-red-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-red-3"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-rose-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-rose-3"] { border-color: #7f4d54 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-yellow-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-yellow-3"] { border-color: #796d3e !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-cyan-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-teal-2"] { border-color: #477277 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-indigo-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-indigo-3"] { border-color: #555c85 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-pink-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-pink-3"] { border-color: #784f69 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-slate-2"],
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] [class*="border-gray-2"] { border-color: #4e5058 !important; }
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] input,
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] textarea,
+:root[${HUB_THEME_ATTRIBUTE}="discord-dark"] select {
+    background-color: #383a40;
+    color: #f2f3f5;
+    border-color: #3f4147;
+}
+`;
+
+function ensureGlobalHubThemeStyle() {
+    if (document.getElementById(HUB_THEME_STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = HUB_THEME_STYLE_ID;
+    style.textContent = HUB_THEME_CSS;
+    (document.head || document.documentElement).appendChild(style);
+}
+
+function getGlobalHubTheme() {
+    try {
+        const selected = localStorage.getItem(HUB_THEME_STORAGE_KEY);
+        return ["default", "discord-dark", "custom-light", "custom-dark"].includes(selected)
+            ? selected
+            : "default";
+    } catch {
+        return "default";
+    }
+}
+
+function isDarkTheme(theme) {
+    return theme === "discord-dark" || theme === "custom-dark";
+}
+
+function isCustomTheme(theme) {
+    return theme === "custom-light" || theme === "custom-dark";
+}
+
+function getCustomThemeOverrides() {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(CUSTOM_THEME_STORAGE_KEY) || "{}");
+        return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function saveCustomThemeOverrides(overrides, historyKey = "custom-theme-edit") {
+    recordThemeHistory(historyKey);
+    try { localStorage.setItem(CUSTOM_THEME_STORAGE_KEY, JSON.stringify(overrides)); } catch {}
+}
+
+function cssEscapeValue(value) {
+    if (window.CSS?.escape) return CSS.escape(String(value));
+    return String(value).replace(/[^a-zA-Z0-9_-]/g, char => `\\${char}`);
+}
+
+function buildSimilarSelector(element) {
+    if (!element || element.nodeType !== 1) return "body";
+
+    const tag = element.tagName.toLowerCase();
+    const attr = (name, value) => `[${name}="${cssEscapeValue(value)}"]`;
+    const nthOfType = el => {
+        const parent = el?.parentElement;
+        if (!parent) return "";
+        const siblings = [...parent.children].filter(child => child.tagName === el.tagName);
+        return siblings.length > 1 ? `:nth-of-type(${siblings.indexOf(el) + 1})` : "";
+    };
+
+    // Prefer semantic identifiers supplied by the application. Combining these
+    // attributes is intentionally stricter than the old single-attribute selector.
+    const semanticAttrs = ["data-slot", "data-sidebar", "role", "type", "name"]
+        .map(name => [name, element.getAttribute(name)])
+        .filter(([, value]) => value);
+    const ariaLabel = element.getAttribute("aria-label");
+    if (ariaLabel && ariaLabel.length <= 100) semanticAttrs.push(["aria-label", ariaLabel]);
+
+    if (semanticAttrs.length) {
+        const preferred = semanticAttrs
+            .filter(([name]) => name === "data-slot" || name === "data-sidebar" || name === "role" || name === "aria-label")
+            .slice(0, 3);
+        const chosen = preferred.length ? preferred : semanticAttrs.slice(0, 2);
+        return `${tag}${chosen.map(([name, value]) => attr(name, value)).join("")}`;
+    }
+
+    const viewerSemanticClasses = [
+        "cell", "valid", "listed", "out-of-stock", "mixed-stock", "section-title",
+        "grid", "grid-wrap", "listing-card", "order-card", "listing-id", "listing-title",
+        "badge", "oos", "ok", "meta", "note", "stat", "stats", "summary", "muted",
+        "right-panel", "controls", "control-row", "legend", "legend-item", "swatch"
+    ];
+    const semantic = viewerSemanticClasses.filter(name => element.classList?.contains(name));
+    if (semantic.length) {
+        return `${tag}${semantic.map(name => `.${cssEscapeValue(name)}`).join("")}`;
+    }
+
+    // Tables are highly repetitive. Match the same cell/header column rather than
+    // every TD/TH that happens to share generic Tailwind classes.
+    if (tag === "td" || tag === "th") {
+        const row = element.parentElement;
+        const section = row?.parentElement;
+        const table = element.closest("table");
+        if (row && table) {
+            const sectionTag = ["thead", "tbody", "tfoot"].includes(section?.tagName?.toLowerCase())
+                ? `${section.tagName.toLowerCase()} `
+                : "";
+            return `table ${sectionTag}tr > ${tag}${nthOfType(element)}`;
+        }
+    }
+
+    // Generic utility classes (spacing, color, typography, layout, etc.) are poor
+    // identity signals and caused the previous selector to spread across the page.
+    const utilityClass = /^(?:p[trblxy]?|m[trblxy]?|space-[xy]|gap|w|h|min-w|min-h|max-w|max-h|size|flex|grid|block|inline|hidden|items|justify|content|self|place|order|grow|shrink|basis|overflow|overscroll|static|fixed|absolute|relative|sticky|inset|top|right|bottom|left|z|float|clear|object|aspect|columns|break|box|display|text|font|leading|tracking|whitespace|align|list|placeholder|bg|from|via|to|border|divide|outline|ring|shadow|opacity|mix-blend|rounded|cursor|select|resize|transition|duration|ease|delay|animate|transform|translate|rotate|skew|scale|origin|accent|appearance|pointer-events|touch|scroll|snap)-/;
+    const genericExact = new Set(["flex", "grid", "block", "inline", "inline-block", "hidden", "relative", "absolute", "sticky", "group", "peer", "truncate"]);
+    const stableClasses = [...(element.classList || [])]
+        .filter(name => /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(name))
+        .filter(name => !genericExact.has(name))
+        .filter(name => !utilityClass.test(name))
+        .filter(name => !/^(hover|focus|active|group|peer|data|aria)-/.test(name))
+        .slice(0, 4);
+
+    const ownSelector = `${tag}${stableClasses.map(name => `.${cssEscapeValue(name)}`).join("")}`;
+
+    // Add one level of structural context when it has a useful semantic hook.
+    // This prevents a class reused in two different widgets from being themed together.
+    let ancestor = element.parentElement;
+    for (let depth = 0; ancestor && depth < 3; depth++, ancestor = ancestor.parentElement) {
+        const ancestorTag = ancestor.tagName.toLowerCase();
+        const dataSlot = ancestor.getAttribute("data-slot");
+        const dataSidebar = ancestor.getAttribute("data-sidebar");
+        const role = ancestor.getAttribute("role");
+        if (dataSlot) return `${ancestorTag}${attr("data-slot", dataSlot)} ${ownSelector}${nthOfType(element)}`;
+        if (dataSidebar) return `${ancestorTag}${attr("data-sidebar", dataSidebar)} ${ownSelector}${nthOfType(element)}`;
+        if (role && ["dialog", "menu", "list", "row", "navigation", "main", "region"].includes(role)) {
+            return `${ancestorTag}${attr("role", role)} ${ownSelector}${nthOfType(element)}`;
+        }
+    }
+
+    // Last resort: tag + stable classes + sibling position. nth-of-type makes this
+    // considerably safer than the old tag-only/class-only fallback.
+    return `${ownSelector}${nthOfType(element)}`;
+}
+
+function resolveCssColorToHex(targetDocument, value) {
+    const text = String(value || "").trim();
+    if (!text) return null;
+    try {
+        const canvas = targetDocument.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) return null;
+        const supports = targetDocument.defaultView?.CSS?.supports;
+        if (supports && !supports.call(targetDocument.defaultView.CSS, "color", text)) return null;
+        context.clearRect(0, 0, 1, 1);
+        context.fillStyle = text;
+        context.fillRect(0, 0, 1, 1);
+        const [r, g, b, a] = context.getImageData(0, 0, 1, 1).data;
+        if (a === 0) return null;
+        return `#${[r, g, b].map(n => n.toString(16).padStart(2, "0")).join("")}`;
+    } catch {
+        return null;
+    }
+}
+
+function isTextBearingElement(element) {
+    if (!element || element.nodeType !== 1) return false;
+    const tag = element.tagName.toLowerCase();
+    if (["html", "body", "style", "script", "noscript", "svg", "path", "canvas", "iframe", "img", "video", "audio"].includes(tag)) return false;
+    const ownText = [...element.childNodes].some(node => node.nodeType === 3 && node.textContent.trim());
+    const textTag = /^(?:a|span|p|label|button|h[1-6]|small|strong|em|b|i|u|li|dt|dd|th|td|caption|option|legend|summary|code|pre|time)$/i.test(tag);
+    return ownText || (textTag && String(element.textContent || "").trim().length > 0);
+}
+
+function textColorRuleKey(sourceHex) {
+    return `__text-color__${String(sourceHex || "").toLowerCase()}`;
+}
+
+function textColorToken(sourceHex) {
+    return `c${String(sourceHex || "").replace("#", "").toLowerCase()}`;
+}
+
+function collectTextColorMatches(targetDocument, sourceHex) {
+    const wanted = String(sourceHex || "").toLowerCase();
+    if (!wanted || !targetDocument.body) return [];
+
+    const canvas = targetDocument.createElement("canvas");
+    canvas.width = 1;
+    canvas.height = 1;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return [];
+
+    const colorToHex = value => {
+        const text = String(value || "").trim();
+        if (!text) return null;
+        try {
+            context.clearRect(0, 0, 1, 1);
+            context.fillStyle = text;
+            context.fillRect(0, 0, 1, 1);
+            const [r, g, b, a] = context.getImageData(0, 0, 1, 1).data;
+            if (a === 0) return null;
+            return `#${[r, g, b].map(n => n.toString(16).padStart(2, "0")).join("")}`;
+        } catch {
+            return null;
+        }
+    };
+
+    const result = [];
+    for (const element of targetDocument.body.querySelectorAll("*")) {
+        if (!isTextBearingElement(element) || element.closest(`[${THEME_EDITOR_ATTR}]`)) continue;
+        const computed = targetDocument.defaultView.getComputedStyle(element);
+        if (computed.display === "none" || computed.visibility === "hidden") continue;
+        if (colorToHex(computed.color)?.toLowerCase() === wanted) result.push(element);
+    }
+    return result;
+}
+
+const CUSTOM_THEME_COLOR_DEFS = [
+    { section: "Core surfaces", key: "background", label: "Page background", cssVar: "--background", viewerVar: "--bg" },
+    { section: "Core surfaces", key: "foreground", label: "Primary text", cssVar: "--foreground", viewerVar: "--text" },
+    { section: "Core surfaces", key: "card", label: "Cards / panels", cssVar: "--card", viewerVar: "--panel" },
+    { section: "Core surfaces", key: "cardForeground", label: "Card text", cssVar: "--card-foreground" },
+    { section: "Core surfaces", key: "popover", label: "Popovers", cssVar: "--popover" },
+    { section: "Core surfaces", key: "popoverForeground", label: "Popover text", cssVar: "--popover-foreground" },
+    { section: "Controls", key: "secondary", label: "Secondary controls", cssVar: "--secondary", viewerVar: "--button-bg" },
+    { section: "Controls", key: "secondaryForeground", label: "Secondary text", cssVar: "--secondary-foreground" },
+    { section: "Controls", key: "muted", label: "Muted surface", cssVar: "--muted", viewerVar: "--input-bg" },
+    { section: "Controls", key: "mutedForeground", label: "Muted text", cssVar: "--muted-foreground", viewerVar: "--muted" },
+    { section: "Controls", key: "accent", label: "Accent", cssVar: "--accent", viewerVar: "--accent" },
+    { section: "Controls", key: "accentForeground", label: "Accent text", cssVar: "--accent-foreground", viewerVar: "--accent-foreground" },
+    { section: "Controls", key: "border", label: "Borders", cssVar: "--border", viewerVar: "--border" },
+    { section: "Controls", key: "input", label: "Inputs", cssVar: "--input" },
+    { section: "Controls", key: "ring", label: "Focus ring", cssVar: "--ring" },
+    { section: "Sidebar", key: "sidebar", label: "Sidebar background", cssVar: "--sidebar" },
+    { section: "Sidebar", key: "sidebarForeground", label: "Sidebar text", cssVar: "--sidebar-foreground" },
+    { section: "Sidebar", key: "sidebarAccent", label: "Sidebar hover / active", cssVar: "--sidebar-accent" },
+    { section: "Sidebar", key: "sidebarAccentForeground", label: "Sidebar hover text", cssVar: "--sidebar-accent-foreground" },
+    { section: "Sidebar", key: "sidebarBorder", label: "Sidebar border", cssVar: "--sidebar-border" },
+    { section: "Text colors", key: "primary", label: "Primary surface / emphasis", cssVar: "--primary" },
+    { section: "Text colors", key: "primaryForeground", label: "Text on primary", cssVar: "--primary-foreground" },
+    { section: "Text colors", key: "destructive", label: "Destructive / error text", cssVar: "--destructive" },
+    { section: "Text colors", key: "destructiveForeground", label: "Text on destructive", cssVar: "--destructive-foreground" },
+    { section: "Text colors", key: "strongText", label: "Strong / near-black text", textGroup: "strong" },
+    { section: "Text colors", key: "bodyText", label: "Body gray text", textGroup: "body" },
+    { section: "Text colors", key: "softText", label: "Soft / muted gray text", textGroup: "soft" },
+    { section: "Text colors", key: "faintText", label: "Faint gray text", textGroup: "faint" },
+    { section: "Text colors", key: "lightText", label: "White / light text", textGroup: "light" },
+    { section: "Text colors", key: "sbcDarkText", label: "SBC dark text token", textGroup: "sbc-dark" },
+    { section: "Text colors", key: "sbcGreenText", label: "SBC green text token", textGroup: "sbc-green" },
+    { section: "SRP viewer", key: "defined", label: "Defined slot", viewerVar: "--defined" },
+    { section: "SRP viewer", key: "listed", label: "Listed / in stock", viewerVar: "--listed" },
+    { section: "SRP viewer", key: "out", label: "Out of stock", viewerVar: "--out" },
+    { section: "SRP viewer", key: "mixed", label: "Mixed stock", viewerVar: "--mixed" },
+    { section: "SRP viewer", key: "listing", label: "Listing cards", viewerVar: "--listing-bg" },
+    { section: "SRP viewer", key: "badge", label: "Badges", viewerVar: "--badge-bg" },
+    { section: "Status colors", key: "purpleSurface", label: "Purple surface", utility: "purple", kind: "surface" },
+    { section: "Status colors", key: "purpleText", label: "Purple text", utility: "purple", kind: "text" },
+    { section: "Status colors", key: "purpleBorder", label: "Purple border", utility: "purple", kind: "border" },
+    { section: "Status colors", key: "blueSurface", label: "Blue surface", utility: "blue", kind: "surface" },
+    { section: "Status colors", key: "blueText", label: "Blue text", utility: "blue", kind: "text" },
+    { section: "Status colors", key: "blueBorder", label: "Blue border", utility: "blue", kind: "border" },
+    { section: "Status colors", key: "greenSurface", label: "Green / emerald surface", utility: "green", kind: "surface" },
+    { section: "Status colors", key: "greenText", label: "Green / emerald text", utility: "green", kind: "text" },
+    { section: "Status colors", key: "greenBorder", label: "Green / emerald border", utility: "green", kind: "border" },
+    { section: "Status colors", key: "orangeSurface", label: "Orange / amber surface", utility: "orange", kind: "surface" },
+    { section: "Status colors", key: "orangeText", label: "Orange / amber text", utility: "orange", kind: "text" },
+    { section: "Status colors", key: "orangeBorder", label: "Orange / amber border", utility: "orange", kind: "border" },
+    { section: "Status colors", key: "redSurface", label: "Red / rose surface", utility: "red", kind: "surface" },
+    { section: "Status colors", key: "redText", label: "Red / rose text", utility: "red", kind: "text" },
+    { section: "Status colors", key: "redBorder", label: "Red / rose border", utility: "red", kind: "border" },
+    { section: "Status colors", key: "yellowSurface", label: "Yellow surface", utility: "yellow", kind: "surface" },
+    { section: "Status colors", key: "yellowText", label: "Yellow text", utility: "yellow", kind: "text" },
+    { section: "Status colors", key: "yellowBorder", label: "Yellow border", utility: "yellow", kind: "border" },
+    { section: "Status colors", key: "cyanSurface", label: "Cyan / teal surface", utility: "cyan", kind: "surface" },
+    { section: "Status colors", key: "cyanText", label: "Cyan / teal text", utility: "cyan", kind: "text" },
+    { section: "Status colors", key: "cyanBorder", label: "Cyan / teal border", utility: "cyan", kind: "border" },
+    { section: "Status colors", key: "indigoSurface", label: "Indigo surface", utility: "indigo", kind: "surface" },
+    { section: "Status colors", key: "indigoText", label: "Indigo text", utility: "indigo", kind: "text" },
+    { section: "Status colors", key: "indigoBorder", label: "Indigo border", utility: "indigo", kind: "border" },
+    { section: "Status colors", key: "pinkSurface", label: "Pink surface", utility: "pink", kind: "surface" },
+    { section: "Status colors", key: "pinkText", label: "Pink text", utility: "pink", kind: "text" },
+    { section: "Status colors", key: "pinkBorder", label: "Pink border", utility: "pink", kind: "border" },
+    { section: "Status colors", key: "neutralSurface", label: "Gray / slate surface", utility: "neutral", kind: "surface" },
+    { section: "Status colors", key: "neutralText", label: "Gray / slate text", utility: "neutral", kind: "text" },
+    { section: "Status colors", key: "neutralBorder", label: "Gray / slate border", utility: "neutral", kind: "border" },
+    { section: "Additional surfaces", key: "whiteOverlaySurface", label: "White translucent surfaces", directSelector: '[class~="bg-white/60"],[class~="bg-white/70"],[class~="bg-white/80"]', property: "background-color" },
+    { section: "Additional surfaces", key: "gradientBase", label: "Generic gradient edge", specialRule: "gradient-base" },
+    { section: "Additional surfaces", key: "gradientPurple", label: "Purple gradient edge", specialRule: "gradient-purple" },
+    { section: "Additional surfaces", key: "gradientBlue", label: "Blue gradient edge", specialRule: "gradient-blue" },
+    { section: "Additional surfaces", key: "gradientGreen", label: "Green / emerald gradient edge", specialRule: "gradient-green" },
+    { section: "Additional surfaces", key: "gradientOrange", label: "Orange / amber gradient edge", specialRule: "gradient-orange" },
+    { section: "Inputs & interaction", key: "buttonHover", label: "SRP button hover", viewerVar: "--button-hover" },
+    { section: "Inputs & interaction", key: "inputText", label: "Input / textarea / select text", directSelector: "input,textarea,select", property: "color" },
+    { section: "Inputs & interaction", key: "inputBackground", label: "Input / textarea / select background", directSelector: "input,textarea,select", property: "background-color" },
+    { section: "Inputs & interaction", key: "inputBorder", label: "Input / textarea / select border", directSelector: "input,textarea,select", property: "border-color" },
+    { section: "SRP viewer details", key: "cellText", label: "Grid cell text", viewerSelector: ".cell", property: "color" },
+    { section: "SRP viewer details", key: "cellDarkText", label: "Out-of-stock cell text", viewerSelector: ".out-of-stock", property: "color" },
+    { section: "SRP viewer details", key: "cellHoverOutline", label: "Grid cell hover outline", viewerSelector: ".cell:hover", property: "outline-color" },
+    { section: "SRP viewer details", key: "cellSelectedOutline", label: "Selected cell outline", viewerSelector: ".selected", property: "outline-color" },
+    { section: "SRP viewer details", key: "swatchBorder", label: "Legend swatch border", viewerSelector: ".swatch", property: "border-color" },
+    { section: "SRP viewer details", key: "errorBorder", label: "Error panel border", viewerSelector: ".status.error-report", property: "border-color" },
+    { section: "SRP viewer details", key: "errorBackground", label: "Error panel background", viewerSelector: ".status.error-report", property: "background-color" },
+    { section: "SRP viewer details", key: "badgeOosBackground", label: "Out-of-stock badge background", viewerSelector: ".badge.oos", property: "background-color" },
+    { section: "SRP viewer details", key: "badgeOosBorder", label: "Out-of-stock badge border", viewerSelector: ".badge.oos", property: "border-color" },
+    { section: "SRP viewer details", key: "badgeOosText", label: "Out-of-stock badge text", viewerSelector: ".badge.oos", property: "color" },
+    { section: "SRP viewer details", key: "badgeOkBackground", label: "In-stock badge background", viewerSelector: ".badge.ok", property: "background-color" },
+    { section: "SRP viewer details", key: "badgeOkBorder", label: "In-stock badge border", viewerSelector: ".badge.ok", property: "border-color" },
+    { section: "SRP viewer details", key: "badgeOkText", label: "In-stock badge text", viewerSelector: ".badge.ok", property: "color" },
+    { section: "SRP viewer details", key: "noteBackground", label: "Warning note background", viewerSelector: ".note", property: "background-color" },
+    { section: "SRP viewer details", key: "noteBorder", label: "Warning note border", viewerSelector: ".note", property: "border-color" },
+    { section: "SRP viewer details", key: "noteText", label: "Warning note text", viewerSelector: ".note", property: "color" },
+    { section: "SRP viewer details", key: "oosLink", label: "Out-of-stock link", viewerSelector: ".listing-id a.oos", property: "color" },
+    { section: "SRP viewer details", key: "oosLinkHover", label: "Out-of-stock link hover", viewerSelector: ".listing-id a.oos:hover", property: "color" },
+    { section: "SRP viewer details", key: "linkHover", label: "Normal link hover", viewerSelector: ".listing-id a:hover", property: "color" },
+    { section: "SRP viewer details", key: "viewerShadow", label: "Embedded viewer shadow", specialRule: "viewer-shadow" },
+    { section: "SRP viewer details", key: "frameErrorText", label: "Viewer load error text", frameErrorProperty: "color" },
+    { section: "SRP viewer details", key: "frameErrorBackground", label: "Viewer load error background", frameErrorProperty: "background-color" }
+];
+
+const CUSTOM_THEME_DEFAULTS = {
+    "custom-light": {
+        background:["#ffffff",100], foreground:["#18181b",100], card:["#ffffff",100], cardForeground:["#18181b",100],
+        popover:["#ffffff",100], popoverForeground:["#18181b",100], secondary:["#f4f4f5",100], secondaryForeground:["#18181b",100],
+        muted:["#f4f4f5",100], mutedForeground:["#71717a",100], accent:["#6a9a1e",100], accentForeground:["#ffffff",100],
+        border:["#e4e4e7",100], input:["#e4e4e7",100], ring:["#6a9a1e",100], sidebar:["#ffffff",100],
+        sidebarForeground:["#18181b",100], sidebarAccent:["#f4f4f5",100], sidebarAccentForeground:["#18181b",100], sidebarBorder:["#e4e4e7",100],
+        primary:["#6a9a1e",100], primaryForeground:["#ffffff",100], destructive:["#dc2626",100], destructiveForeground:["#ffffff",100],
+        strongText:["#18181b",100], bodyText:["#3f3f46",100], softText:["#71717a",100], faintText:["#a1a1aa",100], lightText:["#ffffff",100], sbcDarkText:["#18181b",100], sbcGreenText:["#6a9a1e",100],
+        defined:["#a1a1aa",100], listed:["#6a9a1e",100], out:["#d97706",100], mixed:["#0d9488",100], listing:["#ffffff",100], badge:["#f4f4f5",100],
+        purpleSurface:["#faf5ff",100], purpleText:["#7e22ce",100], purpleBorder:["#d8b4fe",100],
+        blueSurface:["#eff6ff",100], blueText:["#1d4ed8",100], blueBorder:["#bfdbfe",100],
+        greenSurface:["#f0fdf4",100], greenText:["#15803d",100], greenBorder:["#bbf7d0",100],
+        orangeSurface:["#fff7ed",100], orangeText:["#c2410c",100], orangeBorder:["#fed7aa",100],
+        redSurface:["#fef2f2",100], redText:["#b91c1c",100], redBorder:["#fecaca",100],
+        yellowSurface:["#fefce8",100], yellowText:["#a16207",100], yellowBorder:["#fef08a",100],
+        cyanSurface:["#ecfeff",100], cyanText:["#0e7490",100], cyanBorder:["#a5f3fc",100],
+        indigoSurface:["#eef2ff",100], indigoText:["#4338ca",100], indigoBorder:["#c7d2fe",100],
+        pinkSurface:["#fdf2f8",100], pinkText:["#be185d",100], pinkBorder:["#fbcfe8",100],
+        neutralSurface:["#f4f4f5",100], neutralText:["#52525b",100], neutralBorder:["#d4d4d8",100],
+        whiteOverlaySurface:["#ffffff",80], gradientBase:["#ffffff",100], gradientPurple:["#faf5ff",100], gradientBlue:["#eff6ff",100], gradientGreen:["#f0fdf4",100], gradientOrange:["#fff7ed",100],
+        buttonHover:["#f4f4f5",100], inputText:["#18181b",100], inputBackground:["#ffffff",100], inputBorder:["#e4e4e7",100],
+        cellText:["#ffffff",100], cellDarkText:["#111111",100], cellHoverOutline:["#ffffff",100], cellSelectedOutline:["#ffffff",100], swatchBorder:["#777777",100],
+        errorBorder:["#ef4444",55], errorBackground:["#7f1d1d",18], badgeOosBackground:["#d97706",18], badgeOosBorder:["#d97706",60], badgeOosText:["#ffcb8a",100],
+        badgeOkBackground:["#2e8b57",20], badgeOkBorder:["#2e8b57",60], badgeOkText:["#9be0bc",100], noteBackground:["#d97706",12], noteBorder:["#d97706",50], noteText:["#ffcf98",100],
+        oosLink:["#ff5c5c",100], oosLinkHover:["#ff8080",100], linkHover:["#86b83a",100], viewerShadow:["#000000",10], frameErrorText:["#fecaca",100], frameErrorBackground:["#111111",100]
+    },
+    "custom-dark": {
+        background:["#313338",100], foreground:["#f2f3f5",100], card:["#2b2d31",100], cardForeground:["#f2f3f5",100],
+        popover:["#2b2d31",100], popoverForeground:["#f2f3f5",100], secondary:["#383a40",100], secondaryForeground:["#f2f3f5",100],
+        muted:["#383a40",100], mutedForeground:["#b5bac1",100], accent:["#6a9a1e",100], accentForeground:["#ffffff",100],
+        border:["#3f4147",100], input:["#383a40",100], ring:["#6a9a1e",100], sidebar:["#2b2d31",100],
+        sidebarForeground:["#f2f3f5",100], sidebarAccent:["#404249",100], sidebarAccentForeground:["#f2f3f5",100], sidebarBorder:["#3f4147",100],
+        primary:["#6a9a1e",100], primaryForeground:["#ffffff",100], destructive:["#ff6b72",100], destructiveForeground:["#1e1f22",100],
+        strongText:["#f2f3f5",100], bodyText:["#dbdee1",100], softText:["#b5bac1",100], faintText:["#80848e",100], lightText:["#ffffff",100], sbcDarkText:["#f2f3f5",100], sbcGreenText:["#9ed34f",100],
+        defined:["#4e5058",100], listed:["#6a9a1e",100], out:["#d97706",100], mixed:["#0d9488",100], listing:["#2b2d31",100], badge:["#383a40",100],
+        purpleSurface:["#352d42",100], purpleText:["#c9b8ff",100], purpleBorder:["#65547e",100],
+        blueSurface:["#28364a",100], blueText:["#9cc4ff",100], blueBorder:["#4b6488",100],
+        greenSurface:["#283d35",100], greenText:["#7ee2ad",100], greenBorder:["#47745e",100],
+        orangeSurface:["#453629",100], orangeText:["#f4bd7a",100], orangeBorder:["#7c6042",100],
+        redSurface:["#442e33",100], redText:["#ff9da7",100], redBorder:["#7f4d54",100],
+        yellowSurface:["#423b27",100], yellowText:["#f2d675",100], yellowBorder:["#796d3e",100],
+        cyanSurface:["#273d40",100], cyanText:["#78dce0",100], cyanBorder:["#477277",100],
+        indigoSurface:["#303247",100], indigoText:["#aeb7ff",100], indigoBorder:["#555c85",100],
+        pinkSurface:["#422f3c",100], pinkText:["#f4a9d1",100], pinkBorder:["#784f69",100],
+        neutralSurface:["#383a40",100], neutralText:["#cbd0d6",100], neutralBorder:["#4e5058",100],
+        whiteOverlaySurface:["#1e1f22",100], gradientBase:["#313338",100], gradientPurple:["#352d42",100], gradientBlue:["#28364a",100], gradientGreen:["#283d35",100], gradientOrange:["#453629",100],
+        buttonHover:["#404249",100], inputText:["#f2f3f5",100], inputBackground:["#383a40",100], inputBorder:["#3f4147",100],
+        cellText:["#ffffff",100], cellDarkText:["#111111",100], cellHoverOutline:["#ffffff",100], cellSelectedOutline:["#ffffff",100], swatchBorder:["#777777",100],
+        errorBorder:["#ef4444",55], errorBackground:["#7f1d1d",18], badgeOosBackground:["#d97706",18], badgeOosBorder:["#d97706",60], badgeOosText:["#ffcb8a",100],
+        badgeOkBackground:["#2e8b57",20], badgeOkBorder:["#2e8b57",60], badgeOkText:["#9be0bc",100], noteBackground:["#d97706",12], noteBorder:["#d97706",50], noteText:["#ffcf98",100],
+        oosLink:["#ff5c5c",100], oosLinkHover:["#ff8080",100], linkHover:["#9ed34f",100], viewerShadow:["#000000",10], frameErrorText:["#fecaca",100], frameErrorBackground:["#111111",100]
+    }
+};
+
+function normalizeThemeColorEntry(value, fallback) {
+    const fallbackPair = Array.isArray(fallback) ? fallback : ["#000000", 100];
+    if (Array.isArray(value)) {
+        const hex = /^#[0-9a-f]{6}$/i.test(String(value[0] || "")) ? String(value[0]).toLowerCase() : fallbackPair[0];
+        const alpha = Math.max(0, Math.min(100, Number(value[1] ?? fallbackPair[1])));
+        return [hex, Number.isFinite(alpha) ? alpha : fallbackPair[1]];
+    }
+    if (typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value)) return [value.toLowerCase(), 100];
+    return [...fallbackPair];
+}
+
+function getCustomThemePalette(theme) {
+    const defaults = CUSTOM_THEME_DEFAULTS[theme] || CUSTOM_THEME_DEFAULTS["custom-light"];
+    const stored = getCustomThemeOverrides()?.[theme]?.palette || {};
+    const result = {};
+    for (const [key, fallback] of Object.entries(defaults)) result[key] = normalizeThemeColorEntry(stored[key], fallback);
+    return result;
+}
+
+function saveCustomThemePalette(theme, palette) {
+    const all = getCustomThemeOverrides();
+    all[theme] ||= {};
+    all[theme].palette = palette;
+    // Old right-click rules are intentionally retired in v2.9.0.
+    delete all[theme].global;
+    saveCustomThemeOverrides(all);
+}
+
+function colorEntryToCss(entry) {
+    const [hex, alpha] = normalizeThemeColorEntry(entry, ["#000000", 100]);
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    if (alpha >= 99.999) return hex;
+    return `rgba(${r}, ${g}, ${b}, ${(alpha / 100).toFixed(3).replace(/0+$/, "").replace(/\.$/, "")})`;
+}
+
+function utilitySelectors(name, kind) {
+    const groups = {
+        purple:["purple"], blue:["blue"], green:["green","emerald"], orange:["orange","amber"],
+        red:["red","rose"], yellow:["yellow"], cyan:["cyan","teal"], indigo:["indigo"], pink:["pink"], neutral:["slate","gray","zinc","neutral"]
+    };
+    const colors = groups[name] || [name];
+    const selectors = [];
+    for (const color of colors) {
+        if (kind === "surface") {
+            for (const shade of ["50","100"]) selectors.push(`[class~="bg-${color}-${shade}"]`);
+            for (const alpha of ["40","60","70","80"]) selectors.push(`[class~="bg-${color}-50/${alpha}"]`);
+        } else if (kind === "text") {
+            for (const shade of ["400","500","600","700","800","900"]) selectors.push(`[class~="text-${color}-${shade}"]`, `[class*="text-${color}-${shade}/"]`);
+        } else if (kind === "border") {
+            selectors.push(`[class*="border-${color}-2"]`, `[class*="border-${color}-3"]`);
+        }
+    }
+    return selectors;
+}
+
+function textGroupSelectors(group) {
+    const exact = value => `[class~="${value}"]`;
+    const groups = {
+        strong: ["text-black","text-gray-900","text-slate-900","text-zinc-900","text-neutral-900","text-gray-950","text-slate-950","text-zinc-950","text-neutral-950"],
+        body: ["text-gray-800","text-gray-700","text-gray-600","text-slate-800","text-slate-700","text-slate-600","text-zinc-800","text-zinc-700","text-zinc-600","text-neutral-800","text-neutral-700","text-neutral-600"],
+        soft: ["text-gray-500","text-gray-400","text-slate-500","text-slate-400","text-zinc-500","text-zinc-400","text-neutral-500","text-neutral-400"],
+        faint: ["text-gray-300","text-gray-200","text-gray-100","text-slate-300","text-slate-200","text-slate-100","text-zinc-300","text-zinc-200","text-zinc-100","text-neutral-300","text-neutral-200","text-neutral-100"],
+        light: ["text-white","text-gray-50","text-slate-50","text-zinc-50","text-neutral-50"],
+        "sbc-dark": ["text-[var(--sbc-dark)]"],
+        "sbc-green": ["text-[var(--sbc-green)]"]
+    };
+    return (groups[group] || []).flatMap(value => [exact(value), `[class*="${value}/"]`]);
+}
+
+function buildCustomThemeCss(theme, palette, scope = "page") {
+    const rootDecl = [];
+    const viewerDecl = [];
+    const extraRules = [];
+    for (const def of CUSTOM_THEME_COLOR_DEFS) {
+        const value = colorEntryToCss(palette[def.key]);
+        if (def.cssVar) rootDecl.push(`${def.cssVar}:${value} !important`);
+        if (def.viewerVar) viewerDecl.push(`${def.viewerVar}:${value} !important`);
+        if (def.utility) {
+            const selectors = utilitySelectors(def.utility, def.kind);
+            const prop = def.kind === "surface" ? "background-color" : def.kind === "text" ? "color" : "border-color";
+            if (selectors.length) extraRules.push(`${selectors.join(",")} { ${prop}:${value} !important; }`);
+        }
+        if (def.textGroup) {
+            const selectors = textGroupSelectors(def.textGroup);
+            if (selectors.length) extraRules.push(`${selectors.join(",")} { color:${value} !important; }`);
+        }
+        if (def.directSelector && def.property) extraRules.push(`${def.directSelector} { ${def.property}:${value} !important; }`);
+        if (def.viewerSelector && def.property) extraRules.push(`${def.viewerSelector} { ${def.property}:${value} !important; }`);
+    }
+    const p = key => colorEntryToCss(palette[key]);
+
+    // Custom Dark starts from the COMPLETE built-in Dark selector tree. This keeps every
+    // stock dark-mode fix (Tailwind pale surfaces, gradients, status text/borders, etc.)
+    // while the generated custom rules below remain later in the cascade and therefore win.
+    const stockBaseCss = theme === "custom-dark"
+        ? HUB_THEME_CSS.replaceAll(
+            `:root[${HUB_THEME_ATTRIBUTE}="discord-dark"]`,
+            `:root[${ACTIVE_THEME_ATTRIBUTE}="custom-dark"]`
+        )
+        : "";
+
+    extraRules.push(`[class*="bg-gradient-to-"] { background-image:linear-gradient(135deg,${p("gradientBase")},${p("card")}) !important; }`);
+    extraRules.push(`[class*="bg-gradient-to-"][class*="from-purple-"] { background-image:linear-gradient(to right,${p("gradientPurple")},${p("card")},${p("gradientPurple")}) !important; }`);
+    extraRules.push(`[class*="bg-gradient-to-"][class*="from-blue-"] { background-image:linear-gradient(to right,${p("gradientBlue")},${p("card")},${p("gradientBlue")}) !important; }`);
+    extraRules.push(`[class*="bg-gradient-to-"][class*="from-green-"],[class*="bg-gradient-to-"][class*="from-emerald-"] { background-image:linear-gradient(to right,${p("gradientGreen")},${p("card")},${p("gradientGreen")}) !important; }`);
+    extraRules.push(`[class*="bg-gradient-to-"][class*="from-orange-"],[class*="bg-gradient-to-"][class*="from-amber-"] { background-image:linear-gradient(to right,${p("gradientOrange")},${p("card")},${p("gradientOrange")}) !important; }`);
+    extraRules.push(`.legend-item:nth-child(1) .swatch { background:${p("defined")} !important; }`);
+    extraRules.push(`.legend-item:nth-child(2) .swatch { background:${p("listed")} !important; }`);
+    extraRules.push(`.legend-item:nth-child(3) .swatch { background:${p("out")} !important; }`);
+    extraRules.push(`.legend-item:nth-child(4) .swatch { background:${p("mixed")} !important; }`);
+    extraRules.push(`#${VIEWER_HOST_ID} { box-shadow:0 1px 3px ${p("viewerShadow")} !important; }`);
+    const frameErrorCss = `padding:20px;color:${p("frameErrorText")};background:${p("frameErrorBackground")};white-space:pre-wrap`;
+    const scopedRules = ((getCustomThemeOverrides()?.[theme]?.scoped || []))
+        .filter(rule => rule && rule.scope === scope && rule.selector && rule.property && rule.value)
+        .map(rule => `${rule.selector} { ${rule.property}:${rule.value} !important; }`);
+    return `
+${stockBaseCss}
+:root { ${rootDecl.join(";")} ${viewerDecl.join(";")} color-scheme:${theme === "custom-dark" ? "dark" : "light"} !important; }
+body, main[data-slot="sidebar-inset"] { background-color:${p("background")} !important; color:${p("foreground")} !important; }
+[data-sidebar="sidebar"], [data-slot="sidebar"] { background-color:${p("sidebar")} !important; color:${p("sidebarForeground")} !important; border-color:${p("sidebarBorder")} !important; }
+[role="dialog"], [class~="bg-card"], [class~="bg-popover"] { background-color:${p("card")} !important; color:${p("cardForeground")} !important; border-color:${p("border")} !important; }
+[class~="bg-background"] { background-color:${p("background")} !important; }
+[class~="text-foreground"], [class*="text-foreground/"] { color:${p("foreground")} !important; }
+[class~="text-card-foreground"], [class*="text-card-foreground/"] { color:${p("cardForeground")} !important; }
+[class~="text-popover-foreground"], [class*="text-popover-foreground/"] { color:${p("popoverForeground")} !important; }
+[class~="text-primary-foreground"], [class*="text-primary-foreground/"] { color:${p("primaryForeground")} !important; }
+[class~="text-secondary-foreground"], [class*="text-secondary-foreground/"] { color:${p("secondaryForeground")} !important; }
+[class~="text-muted-foreground"], [class*="text-muted-foreground/"] { color:${p("mutedForeground")} !important; }
+[class~="text-accent-foreground"], [class*="text-accent-foreground/"] { color:${p("accentForeground")} !important; }
+[class~="text-destructive"], [class*="text-destructive/"] { color:${p("destructive")} !important; }
+[class~="text-destructive-foreground"], [class*="text-destructive-foreground/"] { color:${p("destructiveForeground")} !important; }
+[data-sidebar="menu-button"], [data-sidebar="group-label"], [data-sidebar="menu-sub-button"] { color:${p("sidebarForeground")} !important; }
+input, textarea, select { border-color:${p("inputBorder")} !important; color:${p("inputText")} !important; background-color:${p("inputBackground")} !important; }
+input::placeholder, textarea::placeholder { color:${p("mutedForeground")} !important; }
+${extraRules.join("\n")}
+${scopedRules.join("\n")}
+`;
+}
+
+function applyCustomThemeStyles(targetDocument, scope = "global", theme = getGlobalHubTheme()) {
+    let style = targetDocument.getElementById(CUSTOM_THEME_STYLE_ID);
+    if (!style) {
+        style = targetDocument.createElement("style");
+        style.id = CUSTOM_THEME_STYLE_ID;
+        (targetDocument.head || targetDocument.documentElement).appendChild(style);
+    }
+    targetDocument.querySelectorAll("[data-tm-theme-text-color]").forEach(el => el.removeAttribute("data-tm-theme-text-color"));
+    if (!isCustomTheme(theme)) {
+        style.textContent = "";
+        return;
+    }
+    const resolvedScope = targetDocument === document ? "page" : "viewer";
+    style.textContent = buildCustomThemeCss(theme, getCustomThemePalette(theme), resolvedScope);
+}
+
+function clearSrpViewerInlineTheme(viewerDocument) {
+    const target = viewerDocument?.documentElement?.style;
+    if (!target) return;
+    for (const name of [
+        "--bg", "--panel", "--input-bg", "--border", "--text", "--muted", "--accent",
+        "--accent-foreground", "--defined", "--button-bg", "--button-hover", "--listing-bg", "--badge-bg"
+    ]) target.removeProperty(name);
+    target.removeProperty("color-scheme");
+    delete viewerDocument.documentElement.dataset.theme;
+}
+
+function setDocumentThemeMode(targetDocument, theme) {
+    if (!targetDocument?.documentElement) return;
+    const root = targetDocument.documentElement;
+    root.setAttribute(ACTIVE_THEME_ATTRIBUTE, theme);
+    // Only the built-in dark theme gets the built-in dark selector tree.
+    if (theme === "discord-dark") root.setAttribute(HUB_THEME_ATTRIBUTE, "discord-dark");
+    else root.removeAttribute(HUB_THEME_ATTRIBUTE);
+}
+
+function ensureThemeSettingsStyle() {
+    if (document.getElementById(THEME_SETTINGS_STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = THEME_SETTINGS_STYLE_ID;
+    style.textContent = `
+#${THEME_SETTINGS_PANEL_ID}{position:fixed;top:0;right:0;width:50vw;min-width:480px;height:100vh;z-index:2147483646;background:var(--card,#fff);color:var(--card-foreground,#18181b);border-left:1px solid var(--border,#ddd);box-shadow:-10px 0 30px rgba(0,0,0,.18);font:13px Inter,ui-sans-serif,system-ui,sans-serif;display:flex;flex-direction:column}
+:root[${THEME_SETTINGS_OPEN_ATTR}="1"] body{overflow-x:hidden !important}
+:root[${THEME_SETTINGS_OPEN_ATTR}="1"] main[data-slot="sidebar-inset"]{margin-right:50vw !important;max-width:calc(100vw - 50vw) !important;width:auto !important;min-width:0 !important;transition:margin-right .16s ease,max-width .16s ease}
+:root[${THEME_SETTINGS_OPEN_ATTR}="1"] header{max-width:100% !important}
+:root[${THEME_SETTINGS_OPEN_ATTR}="1"] #${VIEWER_HOST_ID}{max-width:100% !important}
+#${THEME_SETTINGS_PANEL_ID} *{box-sizing:border-box}
+#${THEME_SETTINGS_PANEL_ID} .tm-head{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border,#ddd);flex:0 0 auto}
+#${THEME_SETTINGS_PANEL_ID} .tm-head h2{font-size:16px;margin:0;flex:1}
+#${THEME_SETTINGS_PANEL_ID} .tm-tabs{display:flex;gap:6px}
+#${THEME_SETTINGS_PANEL_ID} button,#${THEME_SETTINGS_PANEL_ID} select,#${THEME_SETTINGS_PANEL_ID} input{font:inherit}
+#${THEME_SETTINGS_PANEL_ID} button{border:1px solid var(--border,#bbb);background:var(--secondary,#f4f4f5);color:var(--secondary-foreground,#18181b);border-radius:7px;padding:7px 10px;cursor:pointer}
+#${THEME_SETTINGS_PANEL_ID} button[data-active="1"]{outline:2px solid var(--ring,#6a9a1e)}
+#${THEME_SETTINGS_PANEL_ID} .tm-body{overflow:auto;padding:14px 16px 28px;flex:1 1 auto}
+#${THEME_SETTINGS_PANEL_ID} .tm-section{margin-bottom:18px}
+#${THEME_SETTINGS_PANEL_ID} .tm-empty{padding:18px 14px;border:1px dashed var(--border,#bbb);border-radius:8px;color:var(--muted-foreground,#71717a);line-height:1.45}
+#${THEME_SETTINGS_PANEL_ID} .tm-section h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-foreground,#71717a);margin:0 0 8px}
+#${THEME_SETTINGS_PANEL_ID} .tm-row{display:grid;grid-template-columns:minmax(155px,1fr) 48px 88px 110px;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid color-mix(in srgb,var(--border,#ddd) 55%,transparent);border-radius:6px;transition:background .12s ease,outline-color .12s ease}
+#${THEME_SETTINGS_PANEL_ID} .tm-row[${THEME_INSPECT_HIGHLIGHT_ATTR}="1"]{background:color-mix(in srgb,var(--ring,#6a9a1e) 16%,transparent);outline:2px solid var(--ring,#6a9a1e);outline-offset:-2px}
+#${THEME_SETTINGS_PANEL_ID} .tm-row[${THEME_INSPECT_HIGHLIGHT_ATTR}="1"] .tm-label{font-weight:700}
+[${THEME_INSPECT_TARGET_ATTR}="1"]{outline:3px solid var(--ring,#6a9a1e) !important;outline-offset:2px !important}
+#${THEME_SETTINGS_PANEL_ID} .tm-label{min-width:0;line-height:1.2}
+#${THEME_SETTINGS_PANEL_ID} input[type="color"]{width:44px;height:32px;padding:2px;border:1px solid var(--border,#bbb);border-radius:6px;background:transparent}
+#${THEME_SETTINGS_PANEL_ID} input[type="text"]{width:86px;padding:6px;border:1px solid var(--border,#bbb);border-radius:6px;background:var(--background,#fff);color:var(--foreground,#18181b)}
+#${THEME_SETTINGS_PANEL_ID} .tm-alpha{display:grid;grid-template-columns:1fr 34px;gap:5px;align-items:center}
+#${THEME_SETTINGS_PANEL_ID} input[type="range"]{width:100%;min-width:0}
+#${THEME_SETTINGS_PANEL_ID} .tm-alpha span{text-align:right;font-variant-numeric:tabular-nums;font-size:11px;color:var(--muted-foreground,#71717a)}
+#${THEME_SETTINGS_PANEL_ID} .tm-foot{display:flex;gap:8px;padding:10px 16px;border-top:1px solid var(--border,#ddd);flex:0 0 auto}
+#${FOOTER_THEME_CONTROL_ID}{display:flex;align-items:center;justify-content:center;gap:4px;flex:0 0 auto;margin-right:2px}
+#${FOOTER_THEME_CONTROL_ID} select{min-width:0;max-width:132px;height:36px;border:1px solid rgba(255,255,255,.30) !important;border-radius:8px;padding:0 28px 0 9px;background:rgba(255,255,255,.06) !important;color:rgba(255,255,255,.88) !important;font:500 11px Inter,ui-sans-serif,system-ui,sans-serif;cursor:pointer;outline:none}
+#${FOOTER_THEME_CONTROL_ID} select:hover{border-color:rgba(255,255,255,.50) !important;background:rgba(255,255,255,.10) !important;color:#fff !important}
+#${FOOTER_THEME_CONTROL_ID} select option{background:#202827 !important;color:#fff !important}
+#${FOOTER_THEME_CONTROL_ID} button{width:36px;height:36px;border:1px solid rgba(255,255,255,.30) !important;border-radius:8px;background:rgba(255,255,255,.06) !important;color:rgba(255,255,255,.88) !important;cursor:pointer;padding:0;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center}
+#${FOOTER_THEME_CONTROL_ID} button:hover{border-color:rgba(255,255,255,.50) !important;background:rgba(255,255,255,.10) !important;color:#fff !important}
+@media(max-width:639px){#${FOOTER_THEME_CONTROL_ID} select{max-width:92px;padding-left:7px;font-size:10px}}
+@media(max-width:900px){#${THEME_SETTINGS_PANEL_ID}{width:50vw;min-width:360px}#${THEME_SETTINGS_PANEL_ID} .tm-row{grid-template-columns:minmax(130px,1fr) 44px 84px 96px}}
+`;
+    (document.head || document.documentElement).appendChild(style);
+}
+
+function rgbaColorEntry(targetDocument, value, fallback) {
+    const text = String(value || "").trim();
+    if (!text) return [...fallback];
+    try {
+        const canvas = targetDocument.createElement("canvas");
+        canvas.width = 1; canvas.height = 1;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return [...fallback];
+        ctx.clearRect(0, 0, 1, 1);
+        ctx.fillStyle = text;
+        ctx.fillRect(0, 0, 1, 1);
+        const [r,g,b,a] = ctx.getImageData(0,0,1,1).data;
+        if (!a) return [...fallback];
+        const hex = `#${[r,g,b].map(n => n.toString(16).padStart(2,"0")).join("")}`;
+        return [hex, Math.round((a / 255) * 100)];
+    } catch { return [...fallback]; }
+}
+
+function sampleClassColor(targetDocument, className, property, fallback) {
+    const probe = targetDocument.createElement("div");
+    probe.className = className;
+    probe.style.cssText = "position:fixed!important;left:-99999px!important;top:-99999px!important;width:1px!important;height:1px!important;pointer-events:none!important";
+    targetDocument.body.appendChild(probe);
+    const value = targetDocument.defaultView.getComputedStyle(probe).getPropertyValue(property);
+    probe.remove();
+    return rgbaColorEntry(targetDocument, value, fallback);
+}
+
+function stockProbeForDef(def) {
+    if (def.utility) {
+        const first = ({purple:"purple",blue:"blue",green:"green",orange:"orange",red:"red",yellow:"yellow",cyan:"cyan",indigo:"indigo",pink:"pink",neutral:"gray"})[def.utility] || def.utility;
+        if (def.kind === "surface") return [`bg-${first}-50`, "background-color"];
+        if (def.kind === "text") return [`text-${first}-700`, "color"];
+        if (def.kind === "border") return [`border border-${first}-300`, "border-color"];
+    }
+    if (def.textGroup) {
+        const cls = ({strong:"text-gray-900",body:"text-gray-700",soft:"text-gray-500",faint:"text-gray-300",light:"text-white","sbc-dark":"text-[var(--sbc-dark)]","sbc-green":"text-[var(--sbc-green)]"})[def.textGroup];
+        if (cls) return [cls, "color"];
+    }
+    const direct = {
+        whiteOverlaySurface:["bg-white/80","background-color"], inputText:["","color"], inputBackground:["","background-color"], inputBorder:["border","border-color"]
+    };
+    return direct[def.key] || null;
+}
+
+function getStockViewerPalette(customTheme) {
+    const dark = customTheme === "custom-dark";
+    return {
+        defined: dark ? ["#4e5058",100] : ["#a1a1aa",100],
+        listed:["#6a9a1e",100], out:["#d97706",100], mixed:["#0d9488",100],
+        listing: dark ? ["#2b2d31",100] : ["#ffffff",100], badge: dark ? ["#383a40",100] : ["#f4f4f5",100],
+        buttonHover: dark ? ["#404249",100] : ["#f4f4f5",100],
+        cellText:["#ffffff",100], cellDarkText:["#111111",100], cellHoverOutline:["#ffffff",100], cellSelectedOutline:["#ffffff",100], swatchBorder:["#777777",100],
+        errorBorder:["#ef4444",55], errorBackground:["#7f1d1d",18], badgeOosBackground:["#d97706",18], badgeOosBorder:["#d97706",60], badgeOosText:["#ffcb8a",100],
+        badgeOkBackground:["#2e8b57",20], badgeOkBorder:["#2e8b57",60], badgeOkText:["#9be0bc",100], noteBackground:["#d97706",12], noteBorder:["#d97706",50], noteText:["#ffcf98",100],
+        oosLink:["#ff5c5c",100], oosLinkHover:["#ff8080",100], linkHover: dark ? ["#9ed34f",100] : ["#86b83a",100], viewerShadow:["#000000",10], frameErrorText:["#fecaca",100], frameErrorBackground:["#111111",100]
+    };
+}
+
+function captureStockThemePalette(customTheme) {
+    const fallback = CUSTOM_THEME_DEFAULTS[customTheme] || CUSTOM_THEME_DEFAULTS["custom-light"];
+    const result = Object.fromEntries(Object.entries(fallback).map(([k,v]) => [k,[...v]]));
+    if (!document.body || !document.documentElement) return result;
+    const root = document.documentElement;
+    const previousAttr = root.getAttribute(HUB_THEME_ATTRIBUTE);
+    const customStyle = document.getElementById(CUSTOM_THEME_STYLE_ID);
+    const previousCustomCss = customStyle?.textContent || "";
+    try {
+        if (customStyle) customStyle.textContent = "";
+        if (customTheme === "custom-dark") root.setAttribute(HUB_THEME_ATTRIBUTE, "discord-dark");
+        else root.removeAttribute(HUB_THEME_ATTRIBUTE);
+        const rootComputed = getComputedStyle(root);
+        for (const def of CUSTOM_THEME_COLOR_DEFS) {
+            const fb = result[def.key] || ["#000000",100];
+            if (def.cssVar) {
+                const value = rootComputed.getPropertyValue(def.cssVar);
+                if (value.trim()) result[def.key] = rgbaColorEntry(document, value, fb);
+                continue;
+            }
+            const probe = stockProbeForDef(def);
+            if (probe) result[def.key] = sampleClassColor(document, probe[0], probe[1], fb);
+        }
+        Object.assign(result, getStockViewerPalette(customTheme));
+        if (customTheme === "custom-dark") {
+            // These are explicit parts of the built-in Dark CSS rather than native Tailwind probes.
+            const dark = CUSTOM_THEME_DEFAULTS["custom-dark"];
+            for (const key of ["whiteOverlaySurface","gradientBase","gradientPurple","gradientBlue","gradientGreen","gradientOrange","inputText","inputBackground","inputBorder"]) result[key] = [...dark[key]];
+        } else {
+            result.gradientBase = [...result.background];
+            result.gradientPurple = [...result.purpleSurface]; result.gradientBlue = [...result.blueSurface]; result.gradientGreen = [...result.greenSurface]; result.gradientOrange = [...result.orangeSurface];
+            result.inputText = [...result.foreground]; result.inputBackground = [...result.background]; result.inputBorder = [...result.border];
+        }
+    } finally {
+        if (previousAttr == null) root.removeAttribute(HUB_THEME_ATTRIBUTE); else root.setAttribute(HUB_THEME_ATTRIBUTE, previousAttr);
+        if (customStyle) customStyle.textContent = previousCustomCss;
+    }
+    return result;
+}
+
+function resetCustomThemeToStock(customTheme) {
+    // Reset means EXACTLY the corresponding canonical default. Do not sample the live
+    // document: extensions, app state, old custom CSS, or partially loaded styles can
+    // otherwise leak into the saved "default" palette.
+    const defaults = CUSTOM_THEME_DEFAULTS[customTheme] || CUSTOM_THEME_DEFAULTS["custom-light"];
+    const all = getCustomThemeOverrides();
+    all[customTheme] = {
+        palette: Object.fromEntries(Object.entries(defaults).map(([key, value]) => [key, [...value]]))
+    };
+    saveCustomThemeOverrides(all, `reset-${customTheme}-${Date.now()}`);
+}
+
+function saveScopedThemeRule(theme, scope, selector, property, value) {
+    if (!isCustomTheme(theme) || !selector || !property || !value) return;
+    const allowed = new Set([
+        "color", "background-color", "border-top-color", "border-right-color",
+        "border-bottom-color", "border-left-color", "outline-color",
+        "text-decoration-color", "caret-color", "fill", "stroke",
+        "background-image", "box-shadow", "text-shadow"
+    ]);
+    if (!allowed.has(property)) return;
+    const all = getCustomThemeOverrides();
+    all[theme] ||= {};
+    const scoped = Array.isArray(all[theme].scoped) ? all[theme].scoped : [];
+    const existing = scoped.find(rule => rule.scope === scope && rule.selector === selector && rule.property === property);
+    if (existing) existing.value = value;
+    else scoped.push({ scope, selector, property, value });
+    all[theme].scoped = scoped.slice(-800);
+    saveCustomThemeOverrides(all, `scoped:${theme}:${scope}:${selector}:${property}`);
+}
+
+function ensureExactThemeSelector(element, targetDocument) {
+    if (!element || element.nodeType !== 1) return null;
+    if (element.id) {
+        const selector = `#${cssEscapeValue(element.id)}`;
+        try { if (targetDocument.querySelectorAll(selector).length === 1) return selector; } catch {}
+    }
+
+    const semantic = buildSimilarSelector(element);
+    if (semantic) {
+        try { if (targetDocument.querySelectorAll(semantic).length === 1) return semantic; } catch {}
+    }
+
+    // Prefer a persistent structural selector over a temporary inspector attribute.
+    // Build upward only until the path is unique, so saved theme edits survive reloads.
+    const parts = [];
+    for (let node = element, depth = 0; node && node.nodeType === 1 && depth < 10; node = node.parentElement, depth++) {
+        if (node.id) {
+            parts.unshift(`#${cssEscapeValue(node.id)}`);
+        } else {
+            const tag = node.tagName.toLowerCase();
+            const parent = node.parentElement;
+            let part = tag;
+            if (parent) {
+                const sameTag = [...parent.children].filter(child => child.tagName === node.tagName);
+                if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+            }
+            parts.unshift(part);
+        }
+        const structural = parts.join(' > ');
+        try { if (targetDocument.querySelectorAll(structural).length === 1) return structural; } catch {}
+        if (node.id) break;
+    }
+
+    let token = element.getAttribute('data-tm-theme-edit-id');
+    if (!token) {
+        token = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2,8)}`;
+        element.setAttribute('data-tm-theme-edit-id', token);
+    }
+    return `[data-tm-theme-edit-id="${cssEscapeValue(token)}"]`;
+}
+
+function themeInspectorColorTokens(value) {
+    const text = String(value || '');
+    const regex = /#[0-9a-f]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\)/gi;
+    const result = [];
+    let match;
+    while ((match = regex.exec(text))) result.push({ token: match[0], index: match.index });
+    return result;
+}
+
+function themeInspectorPropertyLabel(property) {
+    const labels = {
+        'color':'Text', 'background-color':'Background',
+        'border-top-color':'Border top', 'border-right-color':'Border right',
+        'border-bottom-color':'Border bottom', 'border-left-color':'Border left',
+        'outline-color':'Outline', 'text-decoration-color':'Text decoration',
+        'caret-color':'Caret', 'fill':'SVG fill', 'stroke':'SVG stroke',
+        'background-image':'Gradient', 'box-shadow':'Box shadow', 'text-shadow':'Text shadow'
+    };
+    return labels[property] || property;
+}
+
+function themeInspectorNodeLabel(node, selected) {
+    if (node === selected) return 'Selected';
+    if (node === selected.parentElement) return 'Parent';
+    const tag = node.tagName?.toLowerCase() || 'element';
+    const text = String(node.getAttribute?.('aria-label') || node.textContent || '').trim().replace(/\s+/g, ' ');
+    return text ? `Child ${tag} — ${text.slice(0, 42)}` : `Child ${tag}`;
+}
+
+function normalizeComputedColor(targetDocument, value) {
+    return resolveCssColorToHex(targetDocument, value)?.toLowerCase() || null;
+}
+
+function isTransparentComputedColor(value) {
+    const text = String(value || '').replace(/\s+/g, '').toLowerCase();
+    return !text || text === 'transparent' || text === 'rgba(0,0,0,0)' || /rgba\([^)]*,0(?:\.0+)?\)$/.test(text);
+}
+
+function collectActualThemeColors(selected, targetDocument) {
+    const rows = [];
+    if (!selected || selected.nodeType !== 1) return rows;
+    const nodes = [];
+    if (selected.parentElement && !selected.parentElement.closest?.(`[${THEME_EDITOR_ATTR}]`)) nodes.push(selected.parentElement);
+    nodes.push(selected, ...selected.querySelectorAll('*'));
+
+    const solidProps = [
+        'color','background-color','border-top-color','border-right-color','border-bottom-color','border-left-color',
+        'outline-color','text-decoration-color','caret-color','fill','stroke'
+    ];
+    const complexProps = ['background-image','box-shadow','text-shadow'];
+    const grouped = new Map();
+
+    const add = (node, property, rawValue, colorToken, tokenIndex = null) => {
+        const hex = normalizeComputedColor(targetDocument, colorToken);
+        if (!hex) return;
+        const entry = rgbaColorEntry(targetDocument, colorToken, [hex,100]);
+        const selector = ensureExactThemeSelector(node, targetDocument);
+        if (!selector) return;
+        const key = `${property}|${hex}|${entry[1]}`;
+        if (!grouped.has(key)) grouped.set(key, {
+            id: `actual-${grouped.size}`,
+            property, label: themeInspectorPropertyLabel(property), hex: entry[0], alpha: entry[1],
+            bindings: [], locations: new Set(), selectedDirect: false
+        });
+        const group = grouped.get(key);
+        group.bindings.push({ node, selector, property, rawValue, tokenIndex });
+        group.locations.add(themeInspectorNodeLabel(node, selected));
+        if (node === selected) group.selectedDirect = true;
+    };
+
+    for (const node of nodes) {
+        if (!node || node.nodeType !== 1 || node.closest?.(`[${THEME_EDITOR_ATTR}]`)) continue;
+        let computed;
+        try { computed = targetDocument.defaultView.getComputedStyle(node); } catch { continue; }
+        if (computed.display === 'none' || computed.visibility === 'hidden') continue;
+
+        for (const property of solidProps) {
+            if (property.startsWith('border-')) {
+                const side = property.split('-')[1];
+                const style = computed.getPropertyValue(`border-${side}-style`);
+                const width = parseFloat(computed.getPropertyValue(`border-${side}-width`) || '0');
+                if (!style || style === 'none' || style === 'hidden' || !(width > 0)) continue;
+            }
+            if (property === 'outline-color') {
+                const style = computed.getPropertyValue('outline-style');
+                const width = parseFloat(computed.getPropertyValue('outline-width') || '0');
+                if (!style || style === 'none' || !(width > 0)) continue;
+            }
+            const value = computed.getPropertyValue(property).trim();
+            if (!value) continue;
+            if (property === 'background-color' && isTransparentComputedColor(value)) continue;
+            if ((property === 'fill' || property === 'stroke') && (value === 'none' || isTransparentComputedColor(value))) continue;
+            add(node, property, value, value, null);
+        }
+
+        for (const property of complexProps) {
+            const value = computed.getPropertyValue(property).trim();
+            if (!value || value === 'none') continue;
+            const tokens = themeInspectorColorTokens(value);
+            tokens.forEach((item, index) => add(node, property, value, item.token, index));
+        }
+    }
+
+    rows.push(...grouped.values());
+    rows.sort((a,b) => Number(b.selectedDirect) - Number(a.selectedDirect) || a.label.localeCompare(b.label));
+    return rows;
+}
+
+function replaceNthCssColor(value, tokenIndex, replacement) {
+    let seen = 0;
+    return String(value || '').replace(/#[0-9a-f]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\)/gi, token => {
+        if (seen++ === tokenIndex) return replacement;
+        return token;
+    });
+}
+
+function renderThemeSettingsRows(panel, theme) {
+    const body = panel.querySelector('.tm-body');
+    body.innerHTML = '';
+    const context = panel.__tmInspectContext;
+    const rows = context?.rows || [];
+
+    if (!rows.length) {
+        body.innerHTML = `<div class="tm-empty">Click an element on the page. The editor will show the actual computed colors on that element, its direct parent, and its descendants. Changes are written directly to those exact targets instead of guessing a palette token.</div>`;
+        panel.querySelectorAll('[data-theme-tab]').forEach(button => button.dataset.active = button.dataset.themeTab === theme ? '1' : '0');
+        panel.dataset.editTheme = theme;
+        return;
+    }
+
+    const direct = rows.filter(row => row.selectedDirect);
+    const surrounding = rows.filter(row => !row.selectedDirect);
+    for (const [title, list] of [['Selected element', direct], ['Parent + children', surrounding]]) {
+        if (!list.length) continue;
+        const section = document.createElement('section');
+        section.className = 'tm-section';
+        section.innerHTML = `<h3>${title}</h3>`;
+        for (const item of list) {
+            const row = document.createElement('div');
+            row.className = 'tm-row';
+            row.dataset.actualId = item.id;
+            if (item.selectedDirect) row.setAttribute(THEME_INSPECT_HIGHLIGHT_ATTR, '1');
+            const locations = [...item.locations];
+            const source = locations.length <= 2 ? locations.join(', ') : `${locations.slice(0,2).join(', ')} +${locations.length-2}`;
+            const safeSource = source.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+            row.innerHTML = `<div class="tm-label"><strong>${item.label}</strong><small style="display:block;margin-top:2px;opacity:.68;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${safeSource}">${safeSource}</small></div><input type="color" value="${item.hex}" aria-label="${item.label} color"><input type="text" value="${item.hex}" maxlength="7" spellcheck="false" aria-label="${item.label} hex"><div class="tm-alpha"><input type="range" min="0" max="100" step="1" value="${item.alpha}" aria-label="${item.label} alpha"><span>${Math.round(item.alpha)}%</span></div>`;
+            const color = row.querySelector('input[type="color"]');
+            const text = row.querySelector('input[type="text"]');
+            const range = row.querySelector('input[type="range"]');
+            const alphaText = row.querySelector('.tm-alpha span');
+
+            const commit = () => {
+                const activeTheme = panel.dataset.editTheme || theme;
+                const cssValue = colorEntryToCss([color.value.toLowerCase(), Number(range.value)]);
+                const scope = context.targetDocument === document ? 'page' : 'viewer';
+                for (const binding of item.bindings) {
+                    let value = cssValue;
+                    if (binding.tokenIndex != null) {
+                        let current = binding.rawValue;
+                        try { current = context.targetDocument.defaultView.getComputedStyle(binding.node).getPropertyValue(binding.property).trim() || current; } catch {}
+                        value = replaceNthCssColor(current, binding.tokenIndex, cssValue);
+                    }
+                    saveScopedThemeRule(activeTheme, scope, binding.selector, binding.property, value);
+                }
+                item.hex = color.value.toLowerCase();
+                item.alpha = Number(range.value);
+                text.value = item.hex;
+                alphaText.textContent = `${range.value}%`;
+                installPageWideThemeEditor();
+            };
+            color.addEventListener('input', commit);
+            color.addEventListener('change', commit);
+            range.addEventListener('input', commit);
+            range.addEventListener('change', commit);
+            text.addEventListener('change', () => {
+                const value = text.value.trim();
+                if (/^#[0-9a-f]{6}$/i.test(value)) { color.value = value; commit(); }
+                else text.value = color.value;
+            });
+            section.appendChild(row);
+        }
+        body.appendChild(section);
+    }
+    panel.querySelectorAll('[data-theme-tab]').forEach(button => button.dataset.active = button.dataset.themeTab === theme ? '1' : '0');
+    panel.dataset.editTheme = theme;
+}
+
+function inspectThemeElement(element, targetDocument = document) {
+    const panel = document.getElementById(THEME_SETTINGS_PANEL_ID);
+    if (!panel || !element || element.nodeType !== 1) return;
+    const theme = panel.dataset.editTheme || (isDarkTheme(getGlobalHubTheme()) ? 'custom-dark' : 'custom-light');
+    if (!isCustomTheme(theme)) return;
+
+    document.querySelectorAll(`[${THEME_INSPECT_TARGET_ATTR}]`).forEach(node => node.removeAttribute(THEME_INSPECT_TARGET_ATTR));
+    for (const frame of document.querySelectorAll('iframe')) {
+        try { frame.contentDocument?.querySelectorAll(`[${THEME_INSPECT_TARGET_ATTR}]`).forEach(node => node.removeAttribute(THEME_INSPECT_TARGET_ATTR)); } catch {}
+    }
+    element.setAttribute(THEME_INSPECT_TARGET_ATTR, '1');
+
+    panel.__tmInspectContext = {
+        element,
+        targetDocument,
+        rows: collectActualThemeColors(element, targetDocument)
+    };
+    renderThemeSettingsRows(panel, theme);
+}
+
+function installThemeElementInspector(targetDocument) {
+    if (!targetDocument?.documentElement || targetDocument.documentElement.dataset.tmThemeInspectorInstalled === "1") return;
+    targetDocument.documentElement.dataset.tmThemeInspectorInstalled = "1";
+    targetDocument.addEventListener("click", event => {
+        const panel = document.getElementById(THEME_SETTINGS_PANEL_ID);
+        if (!panel) return;
+        if (targetDocument === document && event.target.closest?.(`#${THEME_SETTINGS_PANEL_ID},#${FOOTER_THEME_CONTROL_ID}`)) return;
+        const element = event.target?.nodeType === 1 ? event.target : event.target?.parentElement;
+        if (!element) return;
+        event.preventDefault();
+        event.stopPropagation();
+        inspectThemeElement(element, targetDocument);
+    }, true);
+}
+
+function installThemeInspectorsEverywhere() {
+    installThemeElementInspector(document);
+    for (const frame of document.querySelectorAll("iframe")) {
+        try { if (frame.contentDocument?.documentElement) installThemeElementInspector(frame.contentDocument); } catch {}
+    }
+}
+
+function setThemeSettingsLayoutOpen(isOpen) {
+    if (!document.documentElement) return;
+    if (isOpen) document.documentElement.setAttribute(THEME_SETTINGS_OPEN_ATTR, "1");
+    else document.documentElement.removeAttribute(THEME_SETTINGS_OPEN_ATTR);
+    // Force responsive layouts/grids to recalculate against the newly available width.
+    try { window.dispatchEvent(new Event("resize")); } catch {}
+}
+
+function closeThemeSettings() {
+    document.getElementById(THEME_SETTINGS_PANEL_ID)?.remove();
+    document.querySelectorAll(`[${THEME_INSPECT_TARGET_ATTR}]`).forEach(node => node.removeAttribute(THEME_INSPECT_TARGET_ATTR));
+    for (const frame of document.querySelectorAll("iframe")) {
+        try { frame.contentDocument?.querySelectorAll(`[${THEME_INSPECT_TARGET_ATTR}]`).forEach(node => node.removeAttribute(THEME_INSPECT_TARGET_ATTR)); } catch {}
+    }
+    setThemeSettingsLayoutOpen(false);
+}
+
+function openThemeSettings(preferredTheme = null) {
+    ensureThemeSettingsStyle();
+    let panel = document.getElementById(THEME_SETTINGS_PANEL_ID);
+    const current = preferredTheme || (isDarkTheme(getGlobalHubTheme()) ? "custom-dark" : "custom-light");
+    if (getGlobalHubTheme() !== current) setGlobalHubTheme(current);
+    if (panel) {
+        setThemeSettingsLayoutOpen(true);
+        const context = panel.__tmInspectContext;
+        if (context?.element?.isConnected) inspectThemeElement(context.element, context.targetDocument);
+        else renderThemeSettingsRows(panel, current);
+        return;
+    }
+    panel = document.createElement("aside");
+    panel.id = THEME_SETTINGS_PANEL_ID;
+    panel.setAttribute(THEME_EDITOR_ATTR, "settings");
+    panel.innerHTML = `<div class="tm-head"><h2>Theme color settings</h2><div class="tm-tabs"><button type="button" data-theme-tab="custom-light">Light Custom</button><button type="button" data-theme-tab="custom-dark">Dark Custom</button></div><button type="button" data-action="close" aria-label="Close theme settings">Close</button></div><div class="tm-body"></div><div class="tm-foot"><button type="button" data-action="undo">Undo</button><button type="button" data-action="redo">Redo</button><button type="button" data-action="use">Use this custom theme</button><button type="button" data-action="reset">Reset to corresponding default</button></div>`;
+    panel.querySelector('[data-action="close"]').addEventListener("click", closeThemeSettings);
+    panel.querySelector('[data-action="undo"]').addEventListener("click", undoThemeChange);
+    panel.querySelector('[data-action="redo"]').addEventListener("click", redoThemeChange);
+    panel.querySelectorAll("[data-theme-tab]").forEach(button => button.addEventListener("click", () => {
+        setGlobalHubTheme(button.dataset.themeTab);
+        const context = panel.__tmInspectContext;
+        if (context?.element?.isConnected) inspectThemeElement(context.element, context.targetDocument);
+        else renderThemeSettingsRows(panel, button.dataset.themeTab);
+    }));
+    panel.querySelector('[data-action="use"]').addEventListener("click", () => setGlobalHubTheme(panel.dataset.editTheme));
+    panel.querySelector('[data-action="reset"]').addEventListener("click", () => {
+        const theme = panel.dataset.editTheme;
+        resetCustomThemeToStock(theme);
+        installPageWideThemeEditor();
+        const context = panel.__tmInspectContext;
+        if (context?.element?.isConnected) inspectThemeElement(context.element, context.targetDocument);
+        else renderThemeSettingsRows(panel, theme);
+    });
+    document.body.appendChild(panel);
+    setThemeSettingsLayoutOpen(true);
+    renderThemeSettingsRows(panel, current);
+    updateThemeHistoryButtons();
+    installThemeInspectorsEverywhere();
+}
+
+function installPageWideThemeEditor() {
+    const theme = getGlobalHubTheme();
+    setDocumentThemeMode(document, theme);
+    applyCustomThemeStyles(document, "global", theme);
+    for (const frame of document.querySelectorAll("iframe")) {
+        try {
+            const frameDocument = frame.contentDocument;
+            if (!frameDocument?.documentElement) continue;
+            setDocumentThemeMode(frameDocument, theme);
+            applyCustomThemeStyles(frameDocument, "global", theme);
+            if (document.getElementById(THEME_SETTINGS_PANEL_ID)) installThemeElementInspector(frameDocument);
+        } catch {
+            // Cross-origin frames cannot be themed from this userscript.
+        }
+    }
+}
+
+function setGlobalHubTheme(theme, persist = true) {
+    const selected = ["default", "discord-dark", "custom-light", "custom-dark"].includes(theme) ? theme : "default";
+    if (persist && selected !== getGlobalHubTheme()) recordThemeHistory(`select:${selected}:${Date.now()}`);
+    if (!document.documentElement) {
+        document.addEventListener("readystatechange", () => setGlobalHubTheme(selected, false), { once: true });
+        if (persist) { try { localStorage.setItem(HUB_THEME_STORAGE_KEY, selected); } catch {} }
+        return selected;
+    }
+    ensureGlobalHubThemeStyle();
+    setDocumentThemeMode(document, selected);
+    if (persist) { try { localStorage.setItem(HUB_THEME_STORAGE_KEY, selected); } catch {} }
+
+    const footerThemeSelect = document.getElementById(FOOTER_THEME_SELECT_ID);
+    if (footerThemeSelect) footerThemeSelect.value = selected;
+    installPageWideThemeEditor();
+
+    const viewerDocument = document.getElementById(VIEWER_HOST_ID)?.querySelector("iframe")?.contentDocument;
+    if (viewerDocument?.documentElement) {
+        setDocumentThemeMode(viewerDocument, selected);
+        if (isCustomTheme(selected)) {
+            clearSrpViewerInlineTheme(viewerDocument);
+            applyCustomThemeStyles(viewerDocument, "global", selected);
+        } else {
+            applyCustomThemeStyles(viewerDocument, "global", selected); // clears stale custom CSS
+            applySrpViewerTheme(viewerDocument, selected === "discord-dark" ? "dark" : "light");
+        }
+    }
+    return selected;
+}
+
+setGlobalHubTheme(getGlobalHubTheme(), false);
+
+
+function injectHeaderThemeControl() {
+    ensureThemeSettingsStyle();
+    const searchButton = [...document.querySelectorAll('header button')].find(button =>
+        /search/i.test(button.textContent || "")
+        || button.querySelector('svg.lucide-search')
+        || /search/i.test(button.getAttribute("aria-label") || "")
+    );
+    const searchContainer = searchButton?.closest("div.relative") || searchButton?.parentElement;
+    const header = searchButton?.closest("header");
+    if (!header || !searchContainer || searchContainer.parentElement !== header) return;
+
+    let wrapper = document.getElementById(FOOTER_THEME_CONTROL_ID);
+    if (wrapper && wrapper.parentElement !== header) wrapper.remove();
+    wrapper = document.getElementById(FOOTER_THEME_CONTROL_ID);
+
+    if (!wrapper) {
+        wrapper = document.createElement("div");
+        wrapper.id = FOOTER_THEME_CONTROL_ID;
+        wrapper.setAttribute("data-tm-theme-header-control", "1");
+
+        const select = document.createElement("select");
+        select.id = FOOTER_THEME_SELECT_ID;
+        select.setAttribute("aria-label", "SBC Hub theme");
+        select.title = "Change the theme for the Hub and SRP Grid Viewer";
+        for (const [value, label] of [["default","Light"],["custom-light","Light (Custom)"],["discord-dark","Dark"],["custom-dark","Dark (Custom)"]]) {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent = label;
+            select.appendChild(option);
+        }
+        select.value = getGlobalHubTheme();
+        select.addEventListener("change", () => setGlobalHubTheme(select.value));
+
+        const settings = document.createElement("button");
+        settings.type = "button";
+        settings.textContent = "⚙";
+        settings.setAttribute("aria-label", "Open theme color settings");
+        settings.title = "Open Light/Dark custom theme color settings";
+        settings.addEventListener("click", event => {
+            event.preventDefault();
+            event.stopPropagation();
+            openThemeSettings();
+        });
+        wrapper.append(select, settings);
+    }
+
+    const select = wrapper.querySelector(`#${FOOTER_THEME_SELECT_ID}`);
+    if (select) select.value = getGlobalHubTheme();
+    if (wrapper.nextElementSibling !== searchContainer) header.insertBefore(wrapper, searchContainer);
+}
+
+function installThemeIntoLoadedFrame(frame) {
+    try {
+        const frameDocument = frame?.contentDocument;
+        if (!frameDocument?.documentElement) return;
+        const theme = getGlobalHubTheme();
+        setDocumentThemeMode(frameDocument, theme);
+        if (isCustomTheme(theme)) {
+            clearSrpViewerInlineTheme(frameDocument);
+            applyCustomThemeStyles(frameDocument, "global", theme);
+        } else {
+            applyCustomThemeStyles(frameDocument, "global", theme);
+            applySrpViewerTheme(frameDocument, theme === "discord-dark" ? "dark" : "light");
+        }
+        if (document.getElementById(THEME_SETTINGS_PANEL_ID)) installThemeElementInspector(frameDocument);
+    } catch {}
+}
+
+function scheduleThemeUiRefresh() {
+    if (scheduleThemeUiRefresh.pending) return;
+    scheduleThemeUiRefresh.pending = true;
+    requestAnimationFrame(() => {
+        scheduleThemeUiRefresh.pending = false;
+        injectHeaderThemeControl();
+        installPageWideThemeEditor();
+    });
+}
+
+function startThemeScript() {
+    injectHeaderThemeControl();
+    installPageWideThemeEditor();
+    document.addEventListener("load", event => {
+        if (event.target?.tagName === "IFRAME") installThemeIntoLoadedFrame(event.target);
+    }, true);
+    const observer = new MutationObserver(scheduleThemeUiRefresh);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+document.addEventListener("keydown", event => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    const target = event.target;
+    const editable = target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/i.test(target?.tagName || "");
+    if (editable) return;
+    const key = String(event.key || "").toLowerCase();
+    const wantsUndo = key === "z" && !event.shiftKey;
+    const wantsRedo = key === "y" || (key === "z" && event.shiftKey);
+    if (!wantsUndo && !wantsRedo) return;
+    const handled = wantsUndo ? undoThemeChange() : redoThemeChange();
+    if (handled) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+}, true);
+
+if (typeof GM_registerMenuCommand === "function") {
+    GM_registerMenuCommand("Toggle Dark Hub Theme", () => {
+        const nextTheme = isDarkTheme(getGlobalHubTheme()) ? "default" : "discord-dark";
+        setGlobalHubTheme(nextTheme);
+    });
+    GM_registerMenuCommand("Undo Theme Change", undoThemeChange);
+    GM_registerMenuCommand("Redo Theme Change", redoThemeChange);
+}
+
+if (document.documentElement) startThemeScript();
+else document.addEventListener("readystatechange", startThemeScript, { once: true });
+
+})();

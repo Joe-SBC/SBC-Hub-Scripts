@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SBC Hub Theme Settings
 // @namespace    https://hub.sbcwork.com/
-// @version      3.2.1
+// @version      3.2.2
 // @description  Adds SBC Hub themes, custom theme settings, header controls, and multi-step undo/redo.
 // @match        https://hub.sbcwork.com/*
 // @updateURL    https://raw.githubusercontent.com/Joe-SBC/SBC-Hub-Scripts/main/SBC_Hub_Theme_Settings.user.js
@@ -1560,7 +1560,19 @@ function injectHeaderThemeControl() {
 
     const select = wrapper.querySelector(`#${FOOTER_THEME_SELECT_ID}`);
     if (select) select.value = getGlobalHubTheme();
-    if (wrapper.nextElementSibling !== searchContainer) header.insertBefore(wrapper, searchContainer);
+    // React can replace the header/search nodes between discovery and insertion.
+    // Always use the search container's CURRENT parent and swallow a mid-render race
+    // instead of letting insertBefore throw into the Hub's error boundary.
+    const liveParent = searchContainer?.parentElement;
+    if (!liveParent || !liveParent.isConnected || !searchContainer.isConnected) return;
+    if (wrapper.parentElement !== liveParent || wrapper.nextElementSibling !== searchContainer) {
+        try {
+            liveParent.insertBefore(wrapper, searchContainer);
+        } catch {
+            // A React commit may have replaced the node during the call. The observer
+            // will retry on the next DOM change, so failing this pass is harmless.
+        }
+    }
 }
 
 function installThemeIntoLoadedFrame(frame) {

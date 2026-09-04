@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         SBC Hub Theme Settings
 // @namespace    https://hub.sbcwork.com/
-// @version      3.2.0
+// @version      3.2.1
 // @description  Adds SBC Hub themes, custom theme settings, header controls, and multi-step undo/redo.
 // @match        https://hub.sbcwork.com/*
+// @updateURL    https://raw.githubusercontent.com/Joe-SBC/SBC-Hub-Scripts/main/SBC_Hub_Theme_Settings.user.js
+// @downloadURL  https://raw.githubusercontent.com/Joe-SBC/SBC-Hub-Scripts/main/SBC_Hub_Theme_Settings.user.js
 // @grant        GM_registerMenuCommand
 // @run-at       document-start
 // @noframes

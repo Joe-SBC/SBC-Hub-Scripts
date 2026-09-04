@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         SBC Work SRP Grid Viewer
 // @namespace    https://hub.sbcwork.com/
-// @version      3.1.0
+// @version      3.1.1
 // @description  Embeds the SRP grid viewer in the SBC Work client area and loads listings/orders from the authenticated API.
 // @match        https://hub.sbcwork.com/*
+// @updateURL    https://raw.githubusercontent.com/Joe-SBC/SBC-Hub-Scripts/main/SBC_Work_SRP_Grid_Viewer.user.js
+// @downloadURL  https://raw.githubusercontent.com/Joe-SBC/SBC-Hub-Scripts/main/SBC_Work_SRP_Grid_Viewer.user.js
 // @grant        GM_registerMenuCommand
 // @run-at       document-start
 // @noframes
